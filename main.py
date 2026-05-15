@@ -32,7 +32,7 @@ COLOR_NOTICE = 0x3498db   # 青
 COLOR_ERROR = 0xe74c3c    # 赤
 
 # カスタマイズ設定 (環境変数から取得)
-UPDATE_INFO = os.getenv("UPDATE_INFO", "OSS版: 環境設定をロードしました。")
+UPDATE_INFO = os.getenv("UPDATE_INFO", "v1.0.1: セットアップ手順が改善されました。")
 SYSTEM_FOOTER = os.getenv("SYSTEM_FOOTER", "Discord Bot System")
 BOT_PRESENCE = os.getenv("BOT_PRESENCE", "Developed by xxxxholic")
 
