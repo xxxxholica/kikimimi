@@ -1,6 +1,7 @@
-discord.py
+discord.py[voice]
 google-cloud-texttospeech
 pydub
 psutil
 python-dotenv
 requests
+pynacl

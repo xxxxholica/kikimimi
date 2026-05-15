@@ -34,7 +34,7 @@ COLOR_ERROR = 0xe74c3c    # 赤
 # カスタマイズ設定 (環境変数から取得)
 UPDATE_INFO = os.getenv("UPDATE_INFO", "OSS版: 環境設定をロードしました。")
 SYSTEM_FOOTER = os.getenv("SYSTEM_FOOTER", "Discord Bot System")
-BOT_PRESENCE = os.getenv("BOT_PRESENCE", "Kikimimi Bot")
+BOT_PRESENCE = os.getenv("BOT_PRESENCE", "Developed by xxxxholic")
 
 # システム案内用
 SYSTEM_VOICE = "ja-JP-Chirp3-HD-Kore"
