@@ -1,0 +1,6 @@
+discord.py
+google-cloud-texttospeech
+pydub
+psutil
+python-dotenv
+requests
