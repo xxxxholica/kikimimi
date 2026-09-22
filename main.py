@@ -129,14 +129,12 @@ CUSTOM_EMOJI_PATTERN = re.compile(r'<a?:(\w+):\d+>')
 URL_PATTERN = re.compile(r'https?://[\w/:%#\$&\?\(\)~\.=\+\-]+')
 TITLE_TAG_PATTERN = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
 
-MAX_TITLE_LENGTH = 20
+MAX_TITLE_LENGTH = 60
 LINK_FETCH_TIMEOUT = 4
 LINK_MAX_REDIRECTS = 3
 LINK_MAX_BYTES = 65536
 
 KNOWN_SITE_LABELS = {
-    "www.youtube.com": "ユーチューブ", "youtu.be": "ユーチューブ",
-    "x.com": "エックス", "twitter.com": "エックス",
     "store.steampowered.com": "スチーム", "steampowered.com": "スチーム",
     "www.instagram.com": "インスタグラム", "instagram.com": "インスタグラム",
     "netmall.hardoff.co.jp": "オフモール",
@@ -243,22 +241,50 @@ def fetch_page_title(url):
         return title[:MAX_TITLE_LENGTH] if title else None
     return None
 
-async def resolve_link_label(url, loop):
+DISCORD_EMBED_WAIT_TIMEOUT = 3.0
+
+def _find_embed_title(message, url):
+    for embed in message.embeds:
+        if embed.url == url and embed.title:
+            return embed.title
+    return None
+
+async def wait_for_discord_embed_title(message, url):
+    """Discordが自動生成するリンク埋め込み(embed)のタイトルを待つ。
+    多くのサイトはDiscordの公式クローラーには情報を渡すため、自前のfetchより成功率が高い。"""
+    title = _find_embed_title(message, url)
+    if title:
+        return title
+
+    def check(before, after):
+        return after.id == message.id and _find_embed_title(after, url)
+
+    try:
+        _, after = await client.wait_for('message_edit', check=check, timeout=DISCORD_EMBED_WAIT_TIMEOUT)
+        return _find_embed_title(after, url)
+    except asyncio.TimeoutError:
+        return None
+
+async def resolve_link_label(url, loop, message):
     netloc = urlparse(url).netloc
     known = lookup_known_label(netloc)
     if known:
         return f"{known}省略"
-    title = await loop.run_in_executor(None, fetch_page_title, url)
+
+    title = await wait_for_discord_embed_title(message, url)
+    if not title:
+        title = await loop.run_in_executor(None, fetch_page_title, url)
     if title:
+        title = re.sub(r'\s+', ' ', title).strip()[:MAX_TITLE_LENGTH]
         return f"リンク省略({title})"
     return f"リンク省略。{extract_base_domain(netloc)}"
 
-async def resolve_links(text):
+async def resolve_links(text, message):
     urls = list(dict.fromkeys(URL_PATTERN.findall(text)))
     if not urls:
         return text
     loop = asyncio.get_running_loop()
-    labels = await asyncio.gather(*(resolve_link_label(url, loop) for url in urls))
+    labels = await asyncio.gather(*(resolve_link_label(url, loop, message) for url in urls))
     for url, label in zip(urls, labels):
         text = text.replace(url, label)
     return text
@@ -288,11 +314,11 @@ def preprocess_text(text, guild):
 
     return text
 
-async def clean_text(text, guild):
+async def clean_text(text, guild, message):
     text = preprocess_text(text, guild)
-    text = await resolve_links(text)
+    text = await resolve_links(text, message)
     text = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), text)
-    return text[:55]
+    return text
 
 # --- TTS エンジン ---
 async def generate_audio_google(text, voice_name):
@@ -501,7 +527,7 @@ async def on_message(message):
         has_image = any(att.content_type and att.content_type.startswith('image') for att in message.attachments)
         attachment_notice = "画像が送信されました。" if has_image else "ファイルが送信されました。"
 
-    cleaned = await clean_text(message.content, message.guild)
+    cleaned = await clean_text(message.content, message.guild, message)
 
     # 最終的な読み上げテキストを構築
     body = (attachment_notice + " " + cleaned).strip()
@@ -510,16 +536,19 @@ async def on_message(message):
         return
 
     channel_id = message.channel.id
-    author_id = message.author.id
-    is_consecutive = client.last_channel_speaker.get(channel_id) == author_id
-    client.last_channel_speaker[channel_id] = author_id
     is_home_channel = channel_id == client.connected_channel_id
 
-    if is_consecutive:
-        final_text = body if is_home_channel else f"{message.channel.name}に投稿されました。{body}"
+    if is_home_channel:
+        final_text = body
     else:
-        display_name = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), message.author.display_name)
-        final_text = f"{display_name}　{body}" if is_home_channel else f"{message.channel.name}に{display_name}が投稿しました。{body}"
+        author_id = message.author.id
+        is_consecutive = client.last_channel_speaker.get(channel_id) == author_id
+        client.last_channel_speaker[channel_id] = author_id
+        if is_consecutive:
+            final_text = f"{message.channel.name}に投稿されました。{body}"
+        else:
+            display_name = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), message.author.display_name)
+            final_text = f"{message.channel.name}に{display_name}が投稿しました。{body}"
 
     user_voices = load_json(USER_VOICES_FILE, {})
     user_id_str = str(message.author.id)
