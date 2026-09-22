@@ -427,6 +427,28 @@ def get_disconnect_embed(text_channel_mention):
     )
     return embed
 
+AUTO_DISCONNECT_GRACE_SECONDS = 8
+
+async def schedule_auto_disconnect(guild, channel_id):
+    """退室検知後、一定時間待ってから本当に誰もいなくなったか再確認して切断する(通信瞬断による誤切断を防止)"""
+    await asyncio.sleep(AUTO_DISCONNECT_GRACE_SECONDS)
+
+    vc = guild.voice_client
+    if not vc or not vc.is_connected() or vc.channel.id != channel_id:
+        return
+    if len(vc.channel.members) > 1:
+        return
+
+    channel_name = vc.channel.name
+    text_channel = client.get_channel(client.connected_channel_id)
+    mention = text_channel.mention if text_channel else "テキストチャンネル"
+    await vc.disconnect()
+    if text_channel:
+        embed = get_disconnect_embed(mention)
+        await text_channel.send(embed=embed)
+    client.connected_channel_id = None
+    print_log(f"自動切断: {channel_name}")
+
 # --- コマンド ---
 @client.tree.command(name='join', description='ボイスチャンネルに接続して読み上げを開始します')
 async def join(interaction: discord.Interaction):
@@ -613,14 +635,7 @@ async def on_voice_state_update(member, before, after):
         await voice_channel_activity(vc, member, "退室", before_channel=before.channel)
         
         if len(vc.channel.members) == 1:
-            text_channel = client.get_channel(client.connected_channel_id)
-            mention = text_channel.mention if text_channel else "テキストチャンネル"
-            await vc.disconnect()
-            if text_channel:
-                embed = get_disconnect_embed(mention)
-                await text_channel.send(embed=embed)
-            client.connected_channel_id = None
-            print_log(f"自動切断: {before.channel.name}")
+            asyncio.create_task(schedule_auto_disconnect(member.guild, vc.channel.id))
 
     elif before.channel and after.channel:
         await voice_channel_activity(vc, member, "移動", before_channel=before.channel, after_channel=after.channel)
