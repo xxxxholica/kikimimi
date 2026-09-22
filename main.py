@@ -130,10 +130,10 @@ CUSTOM_EMOJI_PATTERN = re.compile(r'<a?:(\w+):\d+>')
 URL_PATTERN = re.compile(r'https?://[\w/:%#\$&\?\(\)~\.=\+\-]+')
 TITLE_TAG_PATTERN = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
 
-MAX_TITLE_LENGTH = 60
+MAX_TITLE_LENGTH = 100
 LINK_FETCH_TIMEOUT = 4
 LINK_MAX_REDIRECTS = 3
-LINK_MAX_BYTES = 65536
+LINK_MAX_BYTES = 262144
 
 KNOWN_SITE_LABELS = {
     "store.steampowered.com": "スチーム", "steampowered.com": "スチーム",
@@ -161,12 +161,17 @@ def lookup_known_label(netloc):
             return label
     return None
 
-def extract_base_domain(netloc):
-    """サブドメインを省いたドメイン名を返す(例: www.hinata.works -> hinata.works)"""
-    netloc = netloc.lower().split(":")[0]
-    labels = netloc.split(".")
+def extract_base_domain(hostname):
+    """サブドメインを省いたドメイン名を返す(例: www.hinata.works -> hinata.works)。IPアドレスはそのまま返す。"""
+    hostname = hostname.lower()
+    try:
+        ipaddress.ip_address(hostname)
+        return hostname
+    except ValueError:
+        pass
+    labels = hostname.split(".")
     if len(labels) <= 2:
-        return netloc
+        return hostname
     if ".".join(labels[-2:]) in MULTI_PART_TLDS and len(labels) >= 3:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
@@ -244,48 +249,56 @@ def fetch_page_title(url):
 
 DISCORD_EMBED_WAIT_TIMEOUT = 3.0
 
-def _find_embed_title(message, url):
+def _find_embed_title(message, url, solo_link):
+    """メッセージ内のembedからurlに対応するタイトルを探す。
+    Discordはyoutu.be等の短縮URLを正規化したURLでembed化することがあり文字列が完全一致しないため、
+    メッセージ内のリンクが1つだけ(solo_link)の場合はURL不一致でもタイトルがあれば採用する。"""
     for embed in message.embeds:
         if embed.url == url and embed.title:
             return embed.title
+    if solo_link:
+        for embed in message.embeds:
+            if embed.title:
+                return embed.title
     return None
 
-async def wait_for_discord_embed_title(message, url):
+async def wait_for_discord_embed_title(message, url, solo_link):
     """Discordが自動生成するリンク埋め込み(embed)のタイトルを待つ。
     多くのサイトはDiscordの公式クローラーには情報を渡すため、自前のfetchより成功率が高い。"""
-    title = _find_embed_title(message, url)
+    title = _find_embed_title(message, url, solo_link)
     if title:
         return title
 
     def check(before, after):
-        return after.id == message.id and _find_embed_title(after, url)
+        return after.id == message.id and _find_embed_title(after, url, solo_link)
 
     try:
         _, after = await client.wait_for('message_edit', check=check, timeout=DISCORD_EMBED_WAIT_TIMEOUT)
-        return _find_embed_title(after, url)
+        return _find_embed_title(after, url, solo_link)
     except asyncio.TimeoutError:
         return None
 
-async def resolve_link_label(url, loop, message):
-    netloc = urlparse(url).netloc
-    known = lookup_known_label(netloc)
+async def resolve_link_label(url, loop, message, solo_link):
+    parsed_url = urlparse(url)
+    known = lookup_known_label(parsed_url.netloc)
     if known:
         return f"{known}省略"
 
-    title = await wait_for_discord_embed_title(message, url)
+    title = await wait_for_discord_embed_title(message, url, solo_link)
     if not title:
         title = await loop.run_in_executor(None, fetch_page_title, url)
     if title:
         title = re.sub(r'\s+', ' ', title).strip()[:MAX_TITLE_LENGTH]
         return f"リンク省略({title})"
-    return f"リンク省略。{extract_base_domain(netloc)}"
+    return f"リンク省略。{extract_base_domain(parsed_url.hostname or parsed_url.netloc)}"
 
 async def resolve_links(text, message):
     urls = list(dict.fromkeys(URL_PATTERN.findall(text)))
     if not urls:
         return text
     loop = asyncio.get_running_loop()
-    labels = await asyncio.gather(*(resolve_link_label(url, loop, message) for url in urls))
+    solo_link = len(urls) == 1
+    labels = await asyncio.gather(*(resolve_link_label(url, loop, message, solo_link) for url in urls))
     for url, label in zip(urls, labels):
         text = text.replace(url, label)
     return text
@@ -427,7 +440,7 @@ def get_disconnect_embed(text_channel_mention):
     )
     return embed
 
-AUTO_DISCONNECT_GRACE_SECONDS = 8
+AUTO_DISCONNECT_GRACE_SECONDS = 3
 
 async def schedule_auto_disconnect(guild, channel_id):
     """退室検知後、一定時間待ってから本当に誰もいなくなったか再確認して切断する(通信瞬断による誤切断を防止)"""
