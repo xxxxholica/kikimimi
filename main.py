@@ -35,7 +35,8 @@ COLOR_NOTICE = 0x3498db   # 青
 COLOR_ERROR = 0xe74c3c    # 赤
 
 # カスタマイズ設定 (環境変数から取得)
-UPDATE_INFO = os.getenv("UPDATE_INFO", "v1.1.0: 全チャンネル読み上げ・リンク先タイトル取得・ロール/絵文字読み上げに対応。")
+VERSION = os.getenv("VERSION", "v1.1.0")
+UPDATE_INFO = os.getenv("UPDATE_INFO", "全チャンネル読み上げ・リンク先タイトル取得・ロール/絵文字読み上げに対応。")
 SYSTEM_FOOTER = os.getenv("SYSTEM_FOOTER", "Discord Bot System")
 BOT_PRESENCE = os.getenv("BOT_PRESENCE", "github.com/xxxxholica/kikimimi")
 
@@ -408,7 +409,7 @@ def get_connection_embed(text_channel_mention):
         "- **/voice** - 読み上げボイスの変更\n"
         "- **/set_channel** - 自動接続の設定\n"
         "- **/status** - システム状況表示\n\n"
-        f"**更新情報:**\n`{UPDATE_INFO}`"
+        f"**更新情報:**\n`{VERSION}: {UPDATE_INFO}`"
     )
     return embed
 
@@ -422,7 +423,7 @@ def get_disconnect_embed(text_channel_mention):
         "- **/voice** - 読み上げボイスの変更\n"
         "- **/set_channel** - 自動接続の設定\n"
         "- **/status** - システム状況表示\n\n"
-        f"**更新情報:**\n`{UPDATE_INFO}`"
+        f"**更新情報:**\n`{VERSION}: {UPDATE_INFO}`"
     )
     return embed
 
@@ -500,7 +501,7 @@ async def status(interaction: discord.Interaction):
     embed.add_field(name="稼働時間", value=f"`{uptime}`", inline=True)
     embed.add_field(name="メモリ使用率", value=f"`{mem.percent}%`", inline=True)
     embed.add_field(name="TTS (今月)", value=f"`{tts_data['count']:,} / 1,000,000` 文字", inline=True)
-    embed.add_field(name="更新情報", value=f"`{UPDATE_INFO}`", inline=False)
+    embed.add_field(name="更新情報", value=f"`{VERSION}: {UPDATE_INFO}`", inline=False)
     embed.add_field(name="GitHub", value="[github.com/xxxxholica/kikimimi](https://github.com/xxxxholica/kikimimi)", inline=False)
     embed.add_field(name="エラーログ", value=f"```\n{last_logs}\n```", inline=False)
     embed.set_footer(text=f"{SYSTEM_FOOTER} | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
