@@ -518,7 +518,7 @@ async def on_message(message):
         final_text = body if is_home_channel else f"{message.channel.name}に投稿されました。{body}"
     else:
         display_name = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), message.author.display_name)
-        final_text = f"{display_name}が投稿しました。{body}" if is_home_channel else f"{message.channel.name}に{display_name}が投稿しました。{body}"
+        final_text = f"{display_name}　{body}" if is_home_channel else f"{message.channel.name}に{display_name}が投稿しました。{body}"
 
     user_voices = load_json(USER_VOICES_FILE, {})
     user_id_str = str(message.author.id)
