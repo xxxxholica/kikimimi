@@ -2,6 +2,9 @@ import os
 import io
 import re
 import json
+import html
+import socket
+import ipaddress
 import tempfile
 import asyncio
 import datetime
@@ -10,7 +13,7 @@ import time
 import shutil
 import random
 from collections import Counter
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,7 +35,7 @@ COLOR_NOTICE = 0x3498db   # 青
 COLOR_ERROR = 0xe74c3c    # 赤
 
 # カスタマイズ設定 (環境変数から取得)
-UPDATE_INFO = os.getenv("UPDATE_INFO", "v1.0.1: セットアップ手順が改善されました。")
+UPDATE_INFO = os.getenv("UPDATE_INFO", "v1.1.0: 全チャンネル読み上げ・リンク先タイトル取得・ロール/絵文字読み上げに対応。")
 SYSTEM_FOOTER = os.getenv("SYSTEM_FOOTER", "Discord Bot System")
 BOT_PRESENCE = os.getenv("BOT_PRESENCE", "Developed by xxxxholic")
 
@@ -119,36 +122,176 @@ async def send_embed(interaction, title, description, color=COLOR_NOTICE, epheme
     else:
         await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
 
-def clean_text(text, guild):
+MENTION_PATTERN = re.compile(r'<@!?(\d+)>')
+ROLE_MENTION_PATTERN = re.compile(r'<@&(\d+)>')
+CHANNEL_MENTION_PATTERN = re.compile(r'<#(\d+)>')
+CUSTOM_EMOJI_PATTERN = re.compile(r'<a?:(\w+):\d+>')
+URL_PATTERN = re.compile(r'https?://[\w/:%#\$&\?\(\)~\.=\+\-]+')
+TITLE_TAG_PATTERN = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
+
+MAX_TITLE_LENGTH = 20
+LINK_FETCH_TIMEOUT = 4
+LINK_MAX_REDIRECTS = 3
+LINK_MAX_BYTES = 65536
+
+KNOWN_SITE_LABELS = {
+    "www.youtube.com": "ユーチューブ", "youtu.be": "ユーチューブ",
+    "x.com": "エックス", "twitter.com": "エックス",
+    "store.steampowered.com": "スチーム", "steampowered.com": "スチーム",
+    "www.instagram.com": "インスタグラム", "instagram.com": "インスタグラム",
+    "netmall.hardoff.co.jp": "オフモール",
+    "drive.google.com": "Google Drive",
+}
+
+# サブドメインを問わずマッチさせるドメイン(先頭にwww.等が付いていても一致させる)
+KNOWN_SITE_LABEL_SUFFIXES = {
+    "amzn.asia": "アマゾン",
+    "rakuten.co.jp": "楽天市場",
+    "aliexpress.com": "アリエスプレス",
+}
+
+# ドメイン名フォールバック時に「co.jp」等を1階層としてまとめて扱うための例外リスト
+MULTI_PART_TLDS = {"co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "co.uk", "org.uk", "com.au"}
+
+def lookup_known_label(netloc):
+    netloc = netloc.lower()
+    if netloc in KNOWN_SITE_LABELS:
+        return KNOWN_SITE_LABELS[netloc]
+    for domain, label in KNOWN_SITE_LABEL_SUFFIXES.items():
+        if netloc == domain or netloc.endswith("." + domain):
+            return label
+    return None
+
+def extract_base_domain(netloc):
+    """サブドメインを省いたドメイン名を返す(例: www.hinata.works -> hinata.works)"""
+    netloc = netloc.lower().split(":")[0]
+    labels = netloc.split(".")
+    if len(labels) <= 2:
+        return netloc
+    if ".".join(labels[-2:]) in MULTI_PART_TLDS and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+# SSRF対策: 取得先IPがこれらのレンジに解決される場合はアクセスしない
+PRIVATE_IP_NETWORKS = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+    "::1/128", "fc00::/7", "fe80::/10",
+)]
+
+def _is_public_hostname(hostname):
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return False
+        if any(ip in net for net in PRIVATE_IP_NETWORKS):
+            return False
+    return True
+
+def _decode_html(raw_bytes, header_encoding):
+    for enc in filter(None, [header_encoding, "utf-8", "shift_jis", "euc-jp", "cp932"]):
+        try:
+            return raw_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw_bytes.decode("utf-8", errors="ignore")
+
+def fetch_page_title(url):
+    """URL先のページタイトルを取得する。プライベートIP・非HTML・取得失敗時はNoneを返す。"""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; KikimimiBot/1.0)"}
+    for _ in range(LINK_MAX_REDIRECTS + 1):
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        if not _is_public_hostname(parsed.hostname):
+            return None
+        try:
+            resp = requests.get(url, headers=headers, timeout=LINK_FETCH_TIMEOUT, stream=True, allow_redirects=False)
+        except Exception:
+            return None
+        try:
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    return None
+                url = urljoin(url, location)
+                continue
+            if resp.status_code != 200:
+                return None
+            content_type = resp.headers.get("Content-Type", "")
+            if "html" not in content_type.lower():
+                return None
+            raw = resp.raw.read(LINK_MAX_BYTES, decode_content=True)
+        except Exception:
+            return None
+        finally:
+            resp.close()
+
+        decoded = _decode_html(raw, resp.encoding)
+        match = TITLE_TAG_PATTERN.search(decoded)
+        if not match:
+            return None
+        title = html.unescape(match.group(1))
+        title = re.sub(r'\s+', ' ', title).strip()
+        return title[:MAX_TITLE_LENGTH] if title else None
+    return None
+
+async def resolve_link_label(url, loop):
+    netloc = urlparse(url).netloc
+    known = lookup_known_label(netloc)
+    if known:
+        return f"{known}省略"
+    title = await loop.run_in_executor(None, fetch_page_title, url)
+    if title:
+        return f"リンク省略({title})"
+    return f"リンク省略。{extract_base_domain(netloc)}"
+
+async def resolve_links(text):
+    urls = list(dict.fromkeys(URL_PATTERN.findall(text)))
+    if not urls:
+        return text
+    loop = asyncio.get_running_loop()
+    labels = await asyncio.gather(*(resolve_link_label(url, loop) for url in urls))
+    for url, label in zip(urls, labels):
+        text = text.replace(url, label)
+    return text
+
+def preprocess_text(text, guild):
     if not text:
         return ""
-    
+
     if "```" in text:
         text = "ソースコード省略"
-    
-    text = re.sub(r'\|\|.*?\|\|', '伏せ字', text)
-    
-    mention_pattern = re.compile(r'<@!?(\d+)>')
-    for match in mention_pattern.finditer(text):
-        member = guild.get_member(int(match.group(1)))
-        name = member.display_name if member else "ユーザー"
-        text = text.replace(match.group(0), name)
-    
-    text = re.sub(r'<@&\d+>', '役職メンション', text)
-    text = re.sub(r'<#\d+>', 'チャンネルリンク', text)
-    
-    url_pattern = re.compile(r'https?://[\w/:%#\$&\?\(\)~\.=\+\-]+')
-    if url_pattern.search(text):
-        parsed = urlparse(url_pattern.search(text).group())
-        url_map = {
-            "[www.youtube.com](https://www.youtube.com)": "ユーチューブ", "youtu.be": "ユーチューブ",
-            "x.com": "エックス", "twitter.com": "エックス",
-            "steampowered.com": "スチーム", "instagram.com": "インスタグラム"
-        }
-        text = url_map.get(parsed.netloc, "リンク") + "省略"
 
+    text = re.sub(r'\|\|.*?\|\|', '伏せ字', text)
+
+    for match in MENTION_PATTERN.finditer(text):
+        member = guild.get_member(int(match.group(1)))
+        text = text.replace(match.group(0), member.display_name if member else "ユーザー")
+
+    for match in ROLE_MENTION_PATTERN.finditer(text):
+        role = guild.get_role(int(match.group(1)))
+        text = text.replace(match.group(0), role.name if role else "役職")
+
+    for match in CHANNEL_MENTION_PATTERN.finditer(text):
+        channel = guild.get_channel(int(match.group(1)))
+        text = text.replace(match.group(0), channel.name if channel else "チャンネル")
+
+    text = CUSTOM_EMOJI_PATTERN.sub(lambda m: f":{m.group(1)}:", text)
+
+    return text
+
+async def clean_text(text, guild):
+    text = preprocess_text(text, guild)
+    text = await resolve_links(text)
     text = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), text)
-    
     return text[:55]
 
 # --- TTS エンジン ---
@@ -182,6 +325,7 @@ class KikimimiBot(discord.Client):
         super().__init__(intents=discord.Intents.all())
         self.tree = app_commands.CommandTree(self)
         self.connected_channel_id = None
+        self.last_channel_speaker = {}
 
     async def setup_hook(self):
         try:
@@ -343,9 +487,9 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    if message.author.bot or message.channel.id != client.connected_channel_id:
+    if message.author.bot or not message.guild:
         return
-    
+
     vc = message.guild.voice_client
     if not vc or not vc.is_connected():
         return
@@ -356,13 +500,25 @@ async def on_message(message):
         has_image = any(att.content_type and att.content_type.startswith('image') for att in message.attachments)
         attachment_notice = "画像が送信されました。" if has_image else "ファイルが送信されました。"
 
-    cleaned = clean_text(message.content, message.guild)
-    
-    # 最終的な読み上げテキストを構築
-    final_text = (attachment_notice + " " + cleaned).strip()
+    cleaned = await clean_text(message.content, message.guild)
 
-    if not final_text:
+    # 最終的な読み上げテキストを構築
+    body = (attachment_notice + " " + cleaned).strip()
+
+    if not body:
         return
+
+    channel_id = message.channel.id
+    author_id = message.author.id
+    is_consecutive = client.last_channel_speaker.get(channel_id) == author_id
+    client.last_channel_speaker[channel_id] = author_id
+    is_home_channel = channel_id == client.connected_channel_id
+
+    if is_consecutive:
+        final_text = body if is_home_channel else f"{message.channel.name}に投稿されました。{body}"
+    else:
+        display_name = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), message.author.display_name)
+        final_text = f"{display_name}が投稿しました。{body}" if is_home_channel else f"{message.channel.name}に{display_name}が投稿しました。{body}"
 
     user_voices = load_json(USER_VOICES_FILE, {})
     user_id_str = str(message.author.id)
