@@ -37,7 +37,7 @@ COLOR_ERROR = 0xe74c3c    # 赤
 # カスタマイズ設定 (環境変数から取得)
 UPDATE_INFO = os.getenv("UPDATE_INFO", "v1.1.0: 全チャンネル読み上げ・リンク先タイトル取得・ロール/絵文字読み上げに対応。")
 SYSTEM_FOOTER = os.getenv("SYSTEM_FOOTER", "Discord Bot System")
-BOT_PRESENCE = os.getenv("BOT_PRESENCE", "Developed by xxxxholic")
+BOT_PRESENCE = os.getenv("BOT_PRESENCE", "github.com/xxxxholica/kikimimi")
 
 # システム案内用
 SYSTEM_VOICE = "ja-JP-Chirp3-HD-Kore"
@@ -475,6 +475,7 @@ async def status(interaction: discord.Interaction):
     embed.add_field(name="メモリ使用率", value=f"`{mem.percent}%`", inline=True)
     embed.add_field(name="TTS (今月)", value=f"`{tts_data['count']:,} / 1,000,000` 文字", inline=True)
     embed.add_field(name="更新情報", value=f"`{UPDATE_INFO}`", inline=False)
+    embed.add_field(name="GitHub", value="[github.com/xxxxholica/kikimimi](https://github.com/xxxxholica/kikimimi)", inline=False)
     embed.add_field(name="エラーログ", value=f"```\n{last_logs}\n```", inline=False)
     embed.set_footer(text=f"{SYSTEM_FOOTER} | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     await interaction.response.send_message(embed=embed)
