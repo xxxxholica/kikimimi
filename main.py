@@ -130,7 +130,7 @@ CUSTOM_EMOJI_PATTERN = re.compile(r'<a?:(\w+):\d+>')
 URL_PATTERN = re.compile(r'https?://[\w/:%#\$&\?\(\)~\.=\+\-]+')
 TITLE_TAG_PATTERN = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
 
-MAX_TITLE_LENGTH = 100
+MAX_TITLE_LENGTH = 50
 LINK_FETCH_TIMEOUT = 4
 LINK_MAX_REDIRECTS = 3
 LINK_MAX_BYTES = 262144
@@ -366,15 +366,22 @@ class KikimimiBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.connected_channel_id = None
         self.last_channel_speaker = {}
+        self.command_ids = {}
 
     async def setup_hook(self):
         try:
             discord.opus.load_opus('libopus.so.0')
         except:
             pass
-        await self.tree.sync()
+        synced = await self.tree.sync()
+        self.command_ids = {cmd.name: cmd.id for cmd in synced}
 
 client = KikimimiBot()
+
+def cmd_mention(name):
+    """スラッシュコマンドをタップ可能なチップとして表示するためのメンション文字列を生成する"""
+    command_id = client.command_ids.get(name)
+    return f"</{name}:{command_id}>" if command_id else f"`/{name}`"
 
 # --- 再生ロジック ---
 async def speak(vc, text, voice_name):
@@ -418,10 +425,10 @@ def get_connection_embed(text_channel_mention):
     embed.description = (
         f"{text_channel_mention}に接続しました。 \n\n"
         "**使用可能なコマンド:**\n"
-        "- **/leave** - ボットを切断\n"
-        "- **/voice** - 読み上げボイスの変更\n"
-        "- **/set_channel** - 自動接続の設定\n"
-        "- **/status** - システム状況表示\n\n"
+        f"- {cmd_mention('leave')} - ボットを切断\n"
+        f"- {cmd_mention('voice')} - 読み上げボイスの変更\n"
+        f"- {cmd_mention('set_channel')} - 自動接続の設定\n"
+        f"- {cmd_mention('status')} - システム状況表示\n\n"
         f"**更新情報:**\n`{VERSION}: {UPDATE_INFO}`"
     )
     return embed
@@ -432,10 +439,10 @@ def get_disconnect_embed(text_channel_mention):
     embed.description = (
         f"**{text_channel_mention}** での読み上げを終了しました。\n\n"
         "**利用可能なコマンド:**\n"
-        "- **/join** - ボットを接続\n"
-        "- **/voice** - 読み上げボイスの変更\n"
-        "- **/set_channel** - 自動接続の設定\n"
-        "- **/status** - システム状況表示\n\n"
+        f"- {cmd_mention('join')} - ボットを接続\n"
+        f"- {cmd_mention('voice')} - 読み上げボイスの変更\n"
+        f"- {cmd_mention('set_channel')} - 自動接続の設定\n"
+        f"- {cmd_mention('status')} - システム状況表示\n\n"
         f"**更新情報:**\n`{VERSION}: {UPDATE_INFO}`"
     )
     return embed
