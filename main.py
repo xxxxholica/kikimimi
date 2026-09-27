@@ -752,7 +752,7 @@ class MusicSelect(discord.ui.Select):
             await interaction.response.edit_message(content="再生できませんでした。", embed=None, view=None)
             return
         await play_track(interaction.guild, track)
-        await interaction.response.edit_message(content=None, embed=get_now_playing_embed(track["filename"]), view=self.view)
+        await interaction.response.edit_message(content=None, embed=get_now_playing_embed(track["filename"]), view=None)
 
 class MusicView(discord.ui.View):
     def __init__(self, tracks):
