@@ -85,7 +85,7 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 # 音楽キャッシュ設定 (サーバー単位、直近N件・合計サイズ上限で管理)
 MUSIC_CACHE_MAX_TRACKS = int(os.getenv("MUSIC_CACHE_MAX_TRACKS", "10"))
 MUSIC_CACHE_MAX_MB = int(os.getenv("MUSIC_CACHE_MAX_MB", "200"))
-MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.35"))  # TTS音量を1.0とした相対比
+MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.20"))  # TTS音量を1.0とした相対比
 MUSIC_CACHE_DIR = os.path.join(BASE_DIR, "data", "music_cache")
 MUSIC_CACHE_FILE = os.path.join(BASE_DIR, "data", "music_cache.json")
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".aac"}
