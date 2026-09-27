@@ -671,6 +671,12 @@ def get_disconnect_embed(text_channel_mention):
     )
     return embed
 
+def get_now_playing_embed(filename):
+    """音楽再生開始時の共通リッチEmbedオブジェクトを生成"""
+    embed = discord.Embed(title="音楽再生", color=COLOR_SUCCESS)
+    embed.description = f"**{filename}** を再生します。"
+    return embed
+
 AUTO_DISCONNECT_GRACE_SECONDS = 3
 
 async def schedule_auto_disconnect(guild, channel_id):
@@ -743,10 +749,10 @@ class MusicSelect(discord.ui.Select):
         track = self.tracks_by_id.get(self.values[0])
         vc = interaction.guild.voice_client
         if not track or not vc or not vc.is_connected():
-            await interaction.response.send_message("再生できませんでした。", ephemeral=True)
+            await interaction.response.edit_message(content="再生できませんでした。", embed=None, view=None)
             return
         await play_track(interaction.guild, track)
-        await interaction.response.send_message(f"再生します: {track['filename']}", ephemeral=True)
+        await interaction.response.edit_message(content=None, embed=get_now_playing_embed(track["filename"]), view=self.view)
 
 class MusicView(discord.ui.View):
     def __init__(self, tracks):
@@ -767,7 +773,7 @@ async def play(interaction: discord.Interaction):
         await send_embed(interaction, "案内", "キャッシュされた音楽がありません。音楽ファイルをチャンネルに投稿するとキャッシュされます。", COLOR_NOTICE, True)
         return
 
-    await interaction.response.send_message("再生する曲を選択してください。", view=MusicView(tracks), ephemeral=True)
+    await interaction.response.send_message("再生する曲を選択してください。", view=MusicView(tracks))
 
 @client.tree.command(name='stop', description='再生中の音楽を停止します')
 async def stop(interaction: discord.Interaction):
@@ -780,7 +786,7 @@ async def stop(interaction: discord.Interaction):
     if stopped:
         await send_embed(interaction, "停止", "音楽の再生を停止しました。", COLOR_SUCCESS)
     else:
-        await send_embed(interaction, "案内", "再生中の音楽はありません。", COLOR_NOTICE, True)
+        await send_embed(interaction, "案内", "再生中の音楽はありません。", COLOR_NOTICE)
 
 @client.tree.command(name='set_channel', description='自動入室時の読み上げテキストチャンネルをここに設定します')
 @app_commands.checks.has_permissions(manage_channels=True)
