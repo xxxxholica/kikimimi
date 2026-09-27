@@ -460,9 +460,17 @@ class MixingAudioSource(discord.AudioSource):
 
     def _set_speaking(self, speaking):
         try:
-            asyncio.run_coroutine_threadsafe(self._vc.ws.speak(speaking), self._vc.loop)
-        except Exception:
-            pass
+            future = asyncio.run_coroutine_threadsafe(self._vc.ws.speak(speaking), self._vc.loop)
+            future.add_done_callback(self._log_speaking_result)
+        except Exception as e:
+            print_log(f"[診断] speak()スケジュール失敗: {e}")
+
+    def _log_speaking_result(self, future):
+        try:
+            future.result()
+            print_log(f"[診断] speak()呼び出し成功")
+        except Exception as e:
+            print_log(f"[診断] speak()呼び出し失敗: {e}")
 
     def add(self, source, on_finished=None, volume=1.0):
         with self._lock:
