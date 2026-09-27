@@ -12,6 +12,8 @@ import logging
 import time
 import shutil
 import random
+import struct
+import threading
 from collections import Counter
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
@@ -80,6 +82,13 @@ USER_VOICES_FILE = os.path.join(BASE_DIR, "data", "user_voices.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "data", "config.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 
+# 音楽キャッシュ設定 (サーバー単位、直近N件・合計サイズ上限で管理)
+MUSIC_CACHE_MAX_TRACKS = int(os.getenv("MUSIC_CACHE_MAX_TRACKS", "10"))
+MUSIC_CACHE_MAX_MB = int(os.getenv("MUSIC_CACHE_MAX_MB", "200"))
+MUSIC_CACHE_DIR = os.path.join(BASE_DIR, "data", "music_cache")
+MUSIC_CACHE_FILE = os.path.join(BASE_DIR, "data", "music_cache.json")
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".aac"}
+
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = KEY_PATH
 FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
@@ -114,6 +123,53 @@ def save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
+
+# --- 音楽キャッシュ ---
+def is_audio_attachment(attachment):
+    if attachment.content_type and attachment.content_type.startswith("audio/"):
+        return True
+    ext = os.path.splitext(attachment.filename)[1].lower()
+    return ext in AUDIO_EXTENSIONS
+
+async def cache_music_attachment(guild_id, attachment, uploader_name):
+    """音楽添付ファイルをサーバー単位でキャッシュする。件数・合計サイズの上限を超えたら古い順に削除する。"""
+    max_bytes = MUSIC_CACHE_MAX_MB * 1024 * 1024
+    if attachment.size > max_bytes:
+        print_log(f"音楽キャッシュ: {attachment.filename} はサイズ上限({MUSIC_CACHE_MAX_MB}MB)を超えるためキャッシュしません")
+        return
+
+    guild_dir = os.path.join(MUSIC_CACHE_DIR, str(guild_id))
+    os.makedirs(guild_dir, exist_ok=True)
+    safe_name = re.sub(r'[\\/:*?"<>|]', '_', attachment.filename)
+    local_path = os.path.join(guild_dir, f"{attachment.id}_{safe_name}")
+
+    try:
+        await attachment.save(local_path)
+    except Exception as e:
+        print_log(f"音楽キャッシュ保存エラー: {e}")
+        return
+
+    cache = load_json(MUSIC_CACHE_FILE, {})
+    tracks = cache.setdefault(str(guild_id), [])
+    tracks.insert(0, {
+        "id": str(attachment.id),
+        "filename": attachment.filename,
+        "uploader": uploader_name,
+        "uploaded_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "size": attachment.size,
+        "path": local_path,
+    })
+
+    while len(tracks) > MUSIC_CACHE_MAX_TRACKS or sum(t["size"] for t in tracks) > max_bytes:
+        removed = tracks.pop()
+        if os.path.exists(removed["path"]):
+            try:
+                os.remove(removed["path"])
+            except OSError:
+                pass
+
+    save_json(MUSIC_CACHE_FILE, cache)
+    print_log(f"音楽キャッシュ追加: {attachment.filename} (guild={guild_id})")
 
 # --- ユーティリティ ---
 async def send_embed(interaction, title, description, color=COLOR_NOTICE, ephemeral=False):
@@ -384,24 +440,190 @@ def cmd_mention(name):
     return f"</{name}:{command_id}>" if command_id else f"`/{name}`"
 
 # --- 再生ロジック ---
+# discord.pyのVoiceClientは同時に1つのAudioSourceしか再生できないため、
+# ギルドごとにこのミキサーを1つだけvc.play()し続け、TTS発話と音楽再生を
+# ここに出し入れすることで両者の同時再生(重ね聞き)を実現する。
+FRAME_SIZE = 3840  # 48kHz * 16bit(2byte) * ステレオ(2ch) * 20ms
+SAMPLE_COUNT = FRAME_SIZE // 2
+SAMPLE_FORMAT = f"<{SAMPLE_COUNT}h"
+SILENCE_FRAME = b"\x00" * FRAME_SIZE
+
+class MixingAudioSource(discord.AudioSource):
+    def __init__(self):
+        self._sources = []  # list[tuple[AudioSource, Optional[Callable]]]
+        self._lock = threading.Lock()
+
+    def add(self, source, on_finished=None):
+        with self._lock:
+            self._sources.append((source, on_finished))
+
+    def remove(self, source):
+        with self._lock:
+            self._sources = [(s, cb) for (s, cb) in self._sources if s is not source]
+        try:
+            source.cleanup()
+        except Exception:
+            pass
+
+    def read(self):
+        with self._lock:
+            entries = list(self._sources)
+
+        frames = []
+        finished = []
+        for source, on_finished in entries:
+            try:
+                data = source.read()
+            except Exception:
+                data = b""
+            if not data:
+                finished.append((source, on_finished))
+                continue
+            if len(data) < FRAME_SIZE:
+                data = data + b"\x00" * (FRAME_SIZE - len(data))
+            frames.append(data)
+
+        if finished:
+            with self._lock:
+                self._sources = [(s, cb) for (s, cb) in self._sources if (s, cb) not in finished]
+            for source, on_finished in finished:
+                try:
+                    source.cleanup()
+                except Exception:
+                    pass
+                if on_finished:
+                    on_finished()
+
+        if not frames:
+            return SILENCE_FRAME
+        if len(frames) == 1:
+            return frames[0]
+        return self._mix(frames)
+
+    def _mix(self, frames):
+        mixed = [0] * SAMPLE_COUNT
+        for frame in frames:
+            for i, s in enumerate(struct.unpack(SAMPLE_FORMAT, frame)):
+                mixed[i] += s
+        clipped = [max(-32768, min(32767, v)) for v in mixed]
+        return struct.pack(SAMPLE_FORMAT, *clipped)
+
+    def is_opus(self):
+        return False
+
+    def cleanup(self):
+        with self._lock:
+            entries, self._sources = self._sources, []
+        for source, _ in entries:
+            try:
+                source.cleanup()
+            except Exception:
+                pass
+
+# ギルドID -> 状態 (Botは単一プロセスでの単一/少数サーバー運用を想定しているが、
+# 音楽キャッシュ・再生まわりはサーバー単位で独立させる)
+guild_mixers = {}       # guild_id -> MixingAudioSource
+guild_music_slot = {}   # guild_id -> 現在再生中の音楽AudioSource ( /stop用 )
+guild_tts_queue = {}    # guild_id -> asyncio.Queue (TTSは従来通り逐次再生)
+guild_tts_tasks = {}    # guild_id -> asyncio.Task (TTSキューの消費タスク)
+
+def attach_mixer(vc):
+    """ボイス接続時にミキサーを起動し、そのギルドの再生ハブとして登録する"""
+    mixer = MixingAudioSource()
+    vc.play(mixer)
+    guild_mixers[vc.guild.id] = mixer
+    return mixer
+
+def detach_mixer(guild_id):
+    """切断時にそのギルドの再生関連状態を破棄する"""
+    mixer = guild_mixers.pop(guild_id, None)
+    if mixer:
+        mixer.cleanup()
+    guild_music_slot.pop(guild_id, None)
+    task = guild_tts_tasks.pop(guild_id, None)
+    if task:
+        task.cancel()
+    guild_tts_queue.pop(guild_id, None)
+
+async def process_tts_queue(guild_id):
+    queue = guild_tts_queue[guild_id]
+    try:
+        while True:
+            text, voice_name = await queue.get()
+            mixer = guild_mixers.get(guild_id)
+            if mixer is None:
+                continue
+            temp_path = None
+            try:
+                audio = await generate_audio_google(text, voice_name)
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                    audio.export(f.name, format="mp3")
+                    temp_path = f.name
+
+                source = discord.FFmpegPCMAudio(temp_path, executable=FFMPEG_PATH)
+                finished = asyncio.Event()
+                loop = asyncio.get_running_loop()
+
+                def on_finished(path=temp_path):
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                    loop.call_soon_threadsafe(finished.set)
+
+                mixer.add(source, on_finished=on_finished)
+                await finished.wait()
+            except Exception as e:
+                print_log(f"再生エラー: {e}")
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+    except asyncio.CancelledError:
+        pass
+
 async def speak(vc, text, voice_name):
     if not vc or not vc.is_connected():
         return
-    try:
-        audio = await generate_audio_google(text, voice_name)
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            audio.export(f.name, format="mp3")
-            temp_path = f.name
-        
-        while vc.is_playing():
-            await asyncio.sleep(0.1)
-            
-        vc.play(
-            discord.FFmpegPCMAudio(temp_path, executable=FFMPEG_PATH), 
-            after=lambda e: os.remove(temp_path) if os.path.exists(temp_path) else None
-        )
-    except Exception as e:
-        print_log(f"再生エラー: {e}")
+    guild_id = vc.guild.id
+    if guild_id not in guild_mixers:
+        return
+    queue = guild_tts_queue.setdefault(guild_id, asyncio.Queue())
+    await queue.put((text, voice_name))
+    if guild_id not in guild_tts_tasks or guild_tts_tasks[guild_id].done():
+        guild_tts_tasks[guild_id] = asyncio.create_task(process_tts_queue(guild_id))
+
+async def play_track(guild, track):
+    """指定トラックをそのギルドの音楽スロットで再生する(既存の再生中トラックは差し替え)"""
+    mixer = guild_mixers.get(guild.id)
+    if mixer is None:
+        return False
+
+    old_source = guild_music_slot.pop(guild.id, None)
+    if old_source is not None:
+        mixer.remove(old_source)
+
+    loop = asyncio.get_running_loop()
+    source = discord.FFmpegPCMAudio(track["path"], executable=FFMPEG_PATH)
+
+    def on_finished():
+        def clear():
+            if guild_music_slot.get(guild.id) is source:
+                guild_music_slot.pop(guild.id, None)
+        loop.call_soon_threadsafe(clear)
+
+    guild_music_slot[guild.id] = source
+    mixer.add(source, on_finished=on_finished)
+    return True
+
+async def stop_track(guild):
+    """再生中の音楽を停止する。何も再生していなければFalseを返す"""
+    source = guild_music_slot.pop(guild.id, None)
+    if source is None:
+        return False
+    mixer = guild_mixers.get(guild.id)
+    if mixer:
+        mixer.remove(source)
+    return True
 
 # --- 通知ロジック ---
 async def voice_channel_activity(vc, member, activity_type, before_channel=None, after_channel=None):
@@ -426,6 +648,8 @@ def get_connection_embed(text_channel_mention):
         f"{text_channel_mention}に接続しました。 \n\n"
         "**使用可能なコマンド:**\n"
         f"- {cmd_mention('leave')} - ボットを切断\n"
+        f"- {cmd_mention('play')} - キャッシュされた音楽を再生\n"
+        f"- {cmd_mention('stop')} - 音楽の再生を停止\n"
         f"- {cmd_mention('voice')} - 読み上げボイスの変更\n"
         f"- {cmd_mention('set_channel')} - 自動接続の設定\n"
         f"- {cmd_mention('status')} - システム状況表示\n\n"
@@ -462,6 +686,7 @@ async def schedule_auto_disconnect(guild, channel_id):
     channel_name = vc.channel.name
     text_channel = client.get_channel(client.connected_channel_id)
     mention = text_channel.mention if text_channel else "テキストチャンネル"
+    detach_mixer(guild.id)
     await vc.disconnect()
     if text_channel:
         embed = get_disconnect_embed(mention)
@@ -480,8 +705,9 @@ async def join(interaction: discord.Interaction):
     channel = interaction.user.voice.channel
     try:
         vc = await channel.connect(timeout=10)
+        attach_mixer(vc)
         client.connected_channel_id = interaction.channel_id
-        
+
         embed = get_connection_embed(interaction.channel.mention)
         await interaction.followup.send(embed=embed)
         await speak(vc, "ボイスチャンネルに接続しました。読み上げを開始します。", SYSTEM_VOICE)
@@ -492,12 +718,69 @@ async def join(interaction: discord.Interaction):
 async def leave(interaction: discord.Interaction):
     if interaction.guild.voice_client:
         mention = interaction.channel.mention
+        detach_mixer(interaction.guild.id)
         await interaction.guild.voice_client.disconnect()
         embed = get_disconnect_embed(mention)
         await interaction.response.send_message(embed=embed)
         client.connected_channel_id = None
     else:
         await send_embed(interaction, "エラー", "接続していません。", COLOR_ERROR, True)
+
+class MusicSelect(discord.ui.Select):
+    def __init__(self, tracks):
+        options = [
+            discord.SelectOption(
+                label=track["filename"][:100],
+                description=f'{track["uploader"]} ・ {track["uploaded_at"][:16].replace("T", " ")}'[:100],
+                value=track["id"],
+            )
+            for track in tracks
+        ]
+        super().__init__(placeholder="再生する曲を選択", options=options)
+        self.tracks_by_id = {track["id"]: track for track in tracks}
+
+    async def callback(self, interaction: discord.Interaction):
+        track = self.tracks_by_id.get(self.values[0])
+        vc = interaction.guild.voice_client
+        if not track or not vc or not vc.is_connected():
+            await interaction.response.send_message("再生できませんでした。", ephemeral=True)
+            return
+        await play_track(interaction.guild, track)
+        await interaction.response.send_message(f"再生します: {track['filename']}", ephemeral=True)
+
+class MusicView(discord.ui.View):
+    def __init__(self, tracks):
+        super().__init__(timeout=60)
+        self.add_item(MusicSelect(tracks))
+
+@client.tree.command(name='play', description='サーバーにキャッシュされた音楽を選んで再生します')
+async def play(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await send_embed(interaction, "エラー", "ボイスチャンネルに接続していません。", COLOR_ERROR, True)
+        return
+
+    cache = load_json(MUSIC_CACHE_FILE, {})
+    tracks = [t for t in cache.get(str(interaction.guild.id), []) if os.path.exists(t["path"])]
+
+    if not tracks:
+        await send_embed(interaction, "案内", "キャッシュされた音楽がありません。音楽ファイルをチャンネルに投稿するとキャッシュされます。", COLOR_NOTICE, True)
+        return
+
+    await interaction.response.send_message("再生する曲を選択してください。", view=MusicView(tracks), ephemeral=True)
+
+@client.tree.command(name='stop', description='再生中の音楽を停止します')
+async def stop(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await send_embed(interaction, "エラー", "ボイスチャンネルに接続していません。", COLOR_ERROR, True)
+        return
+
+    stopped = await stop_track(interaction.guild)
+    if stopped:
+        await send_embed(interaction, "停止", "音楽の再生を停止しました。", COLOR_SUCCESS)
+    else:
+        await send_embed(interaction, "案内", "再生中の音楽はありません。", COLOR_NOTICE, True)
 
 @client.tree.command(name='set_channel', description='自動入室時の読み上げテキストチャンネルをここに設定します')
 @app_commands.checks.has_permissions(manage_channels=True)
@@ -560,6 +843,11 @@ async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
+    # 音楽添付ファイルのキャッシュは、ボイスチャンネル未接続時でも行う
+    audio_attachments = [att for att in message.attachments if is_audio_attachment(att)]
+    for att in audio_attachments:
+        await cache_music_attachment(message.guild.id, att, message.author.display_name)
+
     vc = message.guild.voice_client
     if not vc or not vc.is_connected():
         return
@@ -567,8 +855,12 @@ async def on_message(message):
     # 添付ファイル情報の取得
     attachment_notice = ""
     if message.attachments:
-        has_image = any(att.content_type and att.content_type.startswith('image') for att in message.attachments)
-        attachment_notice = "画像が送信されました。" if has_image else "ファイルが送信されました。"
+        if audio_attachments:
+            attachment_notice = "音楽ファイルが送信されました。"
+        elif any(att.content_type and att.content_type.startswith('image') for att in message.attachments):
+            attachment_notice = "画像が送信されました。"
+        else:
+            attachment_notice = "ファイルが送信されました。"
 
     cleaned = await clean_text(message.content, message.guild, message)
 
@@ -622,7 +914,8 @@ async def on_voice_state_update(member, before, after):
     if vc is None and after.channel is not None:
         try:
             vc = await after.channel.connect(timeout=10)
-            
+            attach_mixer(vc)
+
             config = load_json(CONFIG_FILE, {})
             target_id = config.get(str(member.guild.id))
             

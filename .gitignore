@@ -4,5 +4,6 @@ __pycache__/
 logs/
 key/
 data/*.json
+data/music_cache/
 *.mp3
 .DS_Store
