@@ -85,6 +85,7 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 # 音楽キャッシュ設定 (サーバー単位、直近N件・合計サイズ上限で管理)
 MUSIC_CACHE_MAX_TRACKS = int(os.getenv("MUSIC_CACHE_MAX_TRACKS", "10"))
 MUSIC_CACHE_MAX_MB = int(os.getenv("MUSIC_CACHE_MAX_MB", "200"))
+MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.35"))  # TTS音量を1.0とした相対比
 MUSIC_CACHE_DIR = os.path.join(BASE_DIR, "data", "music_cache")
 MUSIC_CACHE_FILE = os.path.join(BASE_DIR, "data", "music_cache.json")
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".aac"}
@@ -450,16 +451,16 @@ SILENCE_FRAME = b"\x00" * FRAME_SIZE
 
 class MixingAudioSource(discord.AudioSource):
     def __init__(self):
-        self._sources = []  # list[tuple[AudioSource, Optional[Callable]]]
+        self._sources = []  # list[tuple[AudioSource, Optional[Callable], float]]
         self._lock = threading.Lock()
 
-    def add(self, source, on_finished=None):
+    def add(self, source, on_finished=None, volume=1.0):
         with self._lock:
-            self._sources.append((source, on_finished))
+            self._sources.append((source, on_finished, volume))
 
     def remove(self, source):
         with self._lock:
-            self._sources = [(s, cb) for (s, cb) in self._sources if s is not source]
+            self._sources = [e for e in self._sources if e[0] is not source]
         try:
             source.cleanup()
         except Exception:
@@ -471,22 +472,22 @@ class MixingAudioSource(discord.AudioSource):
 
         frames = []
         finished = []
-        for source, on_finished in entries:
+        for source, on_finished, volume in entries:
             try:
                 data = source.read()
             except Exception:
                 data = b""
             if not data:
-                finished.append((source, on_finished))
+                finished.append((source, on_finished, volume))
                 continue
             if len(data) < FRAME_SIZE:
                 data = data + b"\x00" * (FRAME_SIZE - len(data))
-            frames.append(data)
+            frames.append((data, volume))
 
         if finished:
             with self._lock:
-                self._sources = [(s, cb) for (s, cb) in self._sources if (s, cb) not in finished]
-            for source, on_finished in finished:
+                self._sources = [e for e in self._sources if e not in finished]
+            for source, on_finished, _ in finished:
                 try:
                     source.cleanup()
                 except Exception:
@@ -496,16 +497,16 @@ class MixingAudioSource(discord.AudioSource):
 
         if not frames:
             return SILENCE_FRAME
-        if len(frames) == 1:
-            return frames[0]
+        if len(frames) == 1 and frames[0][1] == 1.0:
+            return frames[0][0]
         return self._mix(frames)
 
     def _mix(self, frames):
         mixed = [0] * SAMPLE_COUNT
-        for frame in frames:
-            for i, s in enumerate(struct.unpack(SAMPLE_FORMAT, frame)):
-                mixed[i] += s
-        clipped = [max(-32768, min(32767, v)) for v in mixed]
+        for data, volume in frames:
+            for i, s in enumerate(struct.unpack(SAMPLE_FORMAT, data)):
+                mixed[i] += s * volume
+        clipped = [max(-32768, min(32767, int(v))) for v in mixed]
         return struct.pack(SAMPLE_FORMAT, *clipped)
 
     def is_opus(self):
@@ -514,7 +515,7 @@ class MixingAudioSource(discord.AudioSource):
     def cleanup(self):
         with self._lock:
             entries, self._sources = self._sources, []
-        for source, _ in entries:
+        for source, _, _ in entries:
             try:
                 source.cleanup()
             except Exception:
@@ -612,7 +613,7 @@ async def play_track(guild, track):
         loop.call_soon_threadsafe(clear)
 
     guild_music_slot[guild.id] = source
-    mixer.add(source, on_finished=on_finished)
+    mixer.add(source, on_finished=on_finished, volume=MUSIC_VOLUME)
     return True
 
 async def stop_track(guild):
