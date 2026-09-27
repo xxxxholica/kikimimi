@@ -450,9 +450,19 @@ SAMPLE_FORMAT = f"<{SAMPLE_COUNT}h"
 SILENCE_FRAME = b"\x00" * FRAME_SIZE
 
 class MixingAudioSource(discord.AudioSource):
-    def __init__(self):
+    def __init__(self, vc):
         self._sources = []  # list[tuple[AudioSource, Optional[Callable], float]]
         self._lock = threading.Lock()
+        self._vc = vc
+        # このミキサーは常時再生し続けるため、discord.pyが再生開始時に1度だけ
+        # SpeakingState.voiceにした状態を初期値として引き継ぎ、無音区間でnoneに戻す
+        self._speaking = True
+
+    def _set_speaking(self, speaking):
+        try:
+            asyncio.run_coroutine_threadsafe(self._vc.ws.speak(speaking), self._vc.loop)
+        except Exception:
+            pass
 
     def add(self, source, on_finished=None, volume=1.0):
         with self._lock:
@@ -496,7 +506,15 @@ class MixingAudioSource(discord.AudioSource):
                     on_finished()
 
         if not frames:
+            if self._speaking:
+                self._speaking = False
+                self._set_speaking(discord.SpeakingState.none)
             return SILENCE_FRAME
+
+        if not self._speaking:
+            self._speaking = True
+            self._set_speaking(discord.SpeakingState.voice)
+
         if len(frames) == 1 and frames[0][1] == 1.0:
             return frames[0][0]
         return self._mix(frames)
@@ -530,7 +548,7 @@ guild_tts_tasks = {}    # guild_id -> asyncio.Task (TTSキューの消費タス�
 
 def attach_mixer(vc):
     """ボイス接続時にミキサーを起動し、そのギルドの再生ハブとして登録する"""
-    mixer = MixingAudioSource()
+    mixer = MixingAudioSource(vc)
     vc.play(mixer)
     guild_mixers[vc.guild.id] = mixer
     return mixer
