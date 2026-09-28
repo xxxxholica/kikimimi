@@ -85,6 +85,10 @@ USER_VOICES_FILE = os.path.join(BASE_DIR, "data", "user_voices.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "data", "config.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 
+# TTS制限設定 (Google Cloud無料枠 1,000,000文字 / 1発話上限)
+TTS_MONTHLY_LIMIT = int(os.getenv("TTS_MONTHLY_LIMIT", "1000000"))
+MAX_SPEAK_LENGTH = int(os.getenv("MAX_SPEAK_LENGTH", "150"))
+
 # 音楽キャッシュ設定 (サーバー単位、直近N件・合計サイズ上限で管理)
 MUSIC_CACHE_MAX_TRACKS = int(os.getenv("MUSIC_CACHE_MAX_TRACKS", "10"))
 MUSIC_CACHE_MAX_MB = int(os.getenv("MUSIC_CACHE_MAX_MB", "200"))
@@ -126,8 +130,18 @@ def load_json(path, default):
 
 def save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    temp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        os.replace(temp_path, path)
+    except Exception as e:
+        print_log(f"JSON保存エラー ({path}): {e}")
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 # --- 音楽キャッシュ ---
 async def get_audio_duration(file_path):
@@ -438,28 +452,103 @@ async def clean_text(text, guild, message):
     return text
 
 # --- TTS エンジン ---
-async def generate_audio_google(text, voice_name):
-    loop = asyncio.get_running_loop()
-    
-    def tts_process():
-        current_month = datetime.datetime.now().strftime("%Y-%m")
-        data = load_json(WORD_COUNTER_FILE, {"count": 0, "last_reset": current_month})
-        
-        if data.get("last_reset") != current_month:
-            print_log(f"月次リセット: {data.get('last_reset')} -> {current_month}")
-            data["count"] = 0
-            data["last_reset"] = current_month
-            
-        data["count"] += len(text)
+_tts_client = None
+
+def _get_tts_client():
+    global _tts_client
+    if _tts_client is None:
+        _tts_client = texttospeech.TextToSpeechClient()
+    return _tts_client
+
+def get_next_reset_timestamp():
+    """翌月1日 00:00:00 (JST) の Unix タイムスタンプを返す"""
+    now = datetime.datetime.now()
+    if now.month == 12:
+        next_month = datetime.datetime(now.year + 1, 1, 1, 0, 0, 0)
+    else:
+        next_month = datetime.datetime(now.year, now.month + 1, 1, 0, 0, 0)
+    return int(next_month.timestamp())
+
+def get_tts_status():
+    """現在の月間TTS状態を取得・更新する。
+    戻り値: (is_limited: bool, count: int, reset_ts: int)
+    """
+    current_month = datetime.datetime.now().strftime("%Y-%m")
+    data = load_json(WORD_COUNTER_FILE, {"count": 0, "last_reset": current_month, "notified_limit": False, "last_vc_notice": 0})
+    if data.get("last_reset") != current_month:
+        print_log(f"月次リセット: {data.get('last_reset')} -> {current_month}")
+        data["count"] = 0
+        data["last_reset"] = current_month
+        data["notified_limit"] = False
+        data["last_vc_notice"] = 0
         save_json(WORD_COUNTER_FILE, data)
-        
-        client_tts = texttospeech.TextToSpeechClient()
-        s_input = texttospeech.SynthesisInput(text=text)
-        v_params = texttospeech.VoiceSelectionParams(language_code="ja-JP", name=voice_name)
-        a_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-        response = client_tts.synthesize_speech(input=s_input, voice=v_params, audio_config=a_config)
-        return AudioSegment.from_file(io.BytesIO(response.audio_content), format="mp3")
-        
+
+    is_limited = data.get("count", 0) >= TTS_MONTHLY_LIMIT
+    return is_limited, data.get("count", 0), get_next_reset_timestamp()
+
+def get_tts_limit_embed(reset_ts):
+    """月間TTS上限到達時の共通Embedを生成"""
+    return discord.Embed(
+        title="接続できません",
+        description=(
+            f"今月の無料使用量上限（`{TTS_MONTHLY_LIMIT:,}文字`）に達しているため、ボイスチャンネルに接続できません。\n\n"
+            f"**次回のリセット予定**\n<t:{reset_ts}:F>"
+        ),
+        color=COLOR_ERROR
+    )
+
+def check_and_update_tts_count(char_count):
+    """月間TTS文字数を更新する。
+    戻り値: (allowed: bool, just_reached: bool, current_count: int)
+    - allowed: 今回の生成が許可されるか (上限未到達)
+    - just_reached: 今回の生成で初めて月間上限に達したか (通知用)
+    - current_count: 更新後の月間文字数
+    """
+    current_month = datetime.datetime.now().strftime("%Y-%m")
+    data = load_json(WORD_COUNTER_FILE, {"count": 0, "last_reset": current_month, "notified_limit": False, "last_vc_notice": 0})
+
+    if data.get("last_reset") != current_month:
+        print_log(f"月次リセット: {data.get('last_reset')} -> {current_month}")
+        data["count"] = 0
+        data["last_reset"] = current_month
+        data["notified_limit"] = False
+        data["last_vc_notice"] = 0
+
+    current_count = data.get("count", 0)
+    if current_count >= TTS_MONTHLY_LIMIT:
+        return False, False, current_count
+
+    data["count"] = current_count + char_count
+    just_reached = False
+    if data["count"] >= TTS_MONTHLY_LIMIT and not data.get("notified_limit", False):
+        data["notified_limit"] = True
+        just_reached = True
+
+    save_json(WORD_COUNTER_FILE, data)
+    return True, just_reached, data["count"]
+
+async def generate_audio_google(text, voice_name):
+    """Google Cloud TTSで音声を合成する。月間上限到達時は (None, just_reached) を返す。"""
+    loop = asyncio.get_running_loop()
+
+    def tts_process():
+        allowed, just_reached, current_count = check_and_update_tts_count(len(text))
+        if not allowed:
+            print_log(f"TTS月間上限到達中 ({current_count:,} / {TTS_MONTHLY_LIMIT:,}文字): 音声生成をスキップします")
+            return None, False
+
+        try:
+            client_tts = _get_tts_client()
+            s_input = texttospeech.SynthesisInput(text=text)
+            v_params = texttospeech.VoiceSelectionParams(language_code="ja-JP", name=voice_name)
+            a_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
+            response = client_tts.synthesize_speech(input=s_input, voice=v_params, audio_config=a_config)
+            audio = AudioSegment.from_file(io.BytesIO(response.audio_content), format="mp3")
+            return audio, just_reached
+        except Exception as e:
+            print_log(f"Google TTS API エラー: {e}")
+            return None, False
+
     return await loop.run_in_executor(None, tts_process)
 
 # --- Bot クラス ---
@@ -798,7 +887,27 @@ async def process_tts_queue(guild_id):
                 continue
             temp_path = None
             try:
-                audio = await generate_audio_google(text, voice_name)
+                audio, just_reached = await generate_audio_google(text, voice_name)
+
+                if just_reached:
+                    channel_id = client.connected_channel_id
+                    if channel_id:
+                        channel = client.get_channel(channel_id)
+                        if channel:
+                            reset_ts = get_next_reset_timestamp()
+                            embed = get_tts_limit_embed(reset_ts)
+                            asyncio.create_task(channel.send(embed=embed))
+
+                    guild = client.get_guild(guild_id)
+                    if guild and guild.voice_client:
+                        detach_mixer(guild_id)
+                        asyncio.create_task(guild.voice_client.disconnect())
+                        client.connected_channel_id = None
+                    continue
+
+                if audio is None:
+                    continue
+
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                     audio.export(f.name, format="mp3")
                     temp_path = f.name
@@ -1156,7 +1265,13 @@ async def join(interaction: discord.Interaction):
     if not interaction.user.voice:
         await send_embed(interaction, "エラー", "ボイスチャンネルに参加してから実行してください", COLOR_ERROR, True)
         return
-    
+
+    is_limited, _, reset_ts = get_tts_status()
+    if is_limited:
+        embed = get_tts_limit_embed(reset_ts)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
     await interaction.response.defer()
     channel = interaction.user.voice.channel
     try:
@@ -1233,23 +1348,15 @@ async def status(interaction: discord.Interaction):
     uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     mem = psutil.virtual_memory()
     tts_data = load_json(WORD_COUNTER_FILE, {"count": 0})
-    
-    try:
-        with open(current_log_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            error_logs = [l for l in lines if "error" in l.lower() or "エラー" in l][-5:]
-            last_logs = "".join(error_logs) if error_logs else "現在、記録されたエラーはありません。"
-    except:
-        last_logs = "ログを取得できませんでした。"
+    tts_count = tts_data.get("count", 0)
+    limit_suffix = " (上限到達)" if tts_count >= TTS_MONTHLY_LIMIT else ""
 
     embed = discord.Embed(title="ステータス", color=COLOR_NOTICE)
-    embed.add_field(name="稼働時間", value=f"`{uptime}`", inline=True)
-    embed.add_field(name="メモリ使用率", value=f"`{mem.percent}%`", inline=True)
-    embed.add_field(name="TTS (今月)", value=f"`{tts_data['count']:,} / 1,000,000` 文字", inline=True)
+    embed.add_field(name="稼働時間", value=f"`{uptime}`", inline=False)
+    embed.add_field(name="メモリ使用率", value=f"`{mem.percent}%`", inline=False)
+    embed.add_field(name="無料使用量上限", value=f"`{tts_count:,} / {TTS_MONTHLY_LIMIT:,}` 文字{limit_suffix}", inline=False)
     embed.add_field(name="更新情報", value=f"`{VERSION}: {UPDATE_INFO}`", inline=False)
-    embed.add_field(name="GitHub", value="[github.com/xxxxholica/kikimimi](https://github.com/xxxxholica/kikimimi)", inline=False)
-    embed.add_field(name="エラーログ", value=f"```\n{last_logs}\n```", inline=False)
-    embed.set_footer(text=f"{SYSTEM_FOOTER} | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    embed.set_footer(text="https://github.com/xxxxholica/kikimimi")
     await interaction.response.send_message(embed=embed)
 
 # --- イベント ---
@@ -1289,6 +1396,10 @@ async def on_message(message):
 
     if not body:
         return
+
+    # 1メッセージあたりの文字数上限 (長文スパム・無料枠急激消費防止)
+    if len(body) > MAX_SPEAK_LENGTH:
+        body = body[:MAX_SPEAK_LENGTH] + "、以下略"
 
     channel_id = message.channel.id
     is_home_channel = channel_id == client.connected_channel_id
@@ -1332,6 +1443,29 @@ async def on_voice_state_update(member, before, after):
 
     # --- 自動接続ロジック ---
     if vc is None and after.channel is not None:
+        is_limited, _, reset_ts = get_tts_status()
+        if is_limited:
+            config = load_json(CONFIG_FILE, {})
+            target_id = config.get(str(member.guild.id))
+            text_ch = client.get_channel(target_id) if target_id else \
+                      discord.utils.get(member.guild.text_channels, name="読み上げ") or \
+                      member.guild.system_channel or \
+                      member.guild.text_channels[0]
+
+            counter_data = load_json(WORD_COUNTER_FILE, {})
+            last_notice = counter_data.get("last_vc_notice", 0)
+            now_ts = int(time.time())
+            if now_ts - last_notice >= 86400:
+                counter_data["last_vc_notice"] = now_ts
+                save_json(WORD_COUNTER_FILE, counter_data)
+                if text_ch:
+                    embed = get_tts_limit_embed(reset_ts)
+                    try:
+                        await text_ch.send(embed=embed)
+                    except Exception as e:
+                        print_log(f"上限通知送信エラー: {e}")
+            return
+
         try:
             vc = await after.channel.connect(timeout=10)
             attach_mixer(vc)
