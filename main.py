@@ -40,8 +40,8 @@ COLOR_PAUSED = 0xf1c40f   # 音楽一時停止 (アンバーイエロー)
 COLOR_IDLE = 0x2b2d31     # 音楽待機/停止 (スレートグレー)
 
 # カスタマイズ設定 (環境変数から取得)
-VERSION = os.getenv("VERSION", "v1.1.0")
-UPDATE_INFO = os.getenv("UPDATE_INFO", "全チャンネル読み上げ・リンク先タイトル取得・ロール/絵文字読み上げに対応。")
+VERSION = os.getenv("VERSION", "v1.2.0")
+UPDATE_INFO = os.getenv("UPDATE_INFO", "音楽再生機能を追加。読み上げと同時再生や/musicのプログレスバーUIに対応。")
 SYSTEM_FOOTER = os.getenv("SYSTEM_FOOTER", "Discord Bot System")
 BOT_PRESENCE = os.getenv("BOT_PRESENCE", "github.com/xxxxholica/kikimimi")
 
