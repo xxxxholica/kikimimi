@@ -35,6 +35,9 @@ START_TIME = time.time()
 COLOR_SUCCESS = 0x2ecc71  # 緑
 COLOR_NOTICE = 0x3498db   # 青
 COLOR_ERROR = 0xe74c3c    # 赤
+COLOR_PLAYER = 0x1db954   # 音楽再生中 (Spotify Green)
+COLOR_PAUSED = 0xf1c40f   # 音楽一時停止 (アンバーイエロー)
+COLOR_IDLE = 0x2b2d31     # 音楽待機/停止 (スレートグレー)
 
 # カスタマイズ設定 (環境変数から取得)
 VERSION = os.getenv("VERSION", "v1.1.0")
@@ -92,6 +95,7 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".aac"}
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = KEY_PATH
 FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+FFPROBE_PATH = shutil.which("ffprobe") or "/usr/bin/ffprobe"
 
 # --- ログ設定 ---
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -126,6 +130,45 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 # --- 音楽キャッシュ ---
+async def get_audio_duration(file_path):
+    """ffprobeを使用して音声ファイルの総再生時間(秒)を取得する"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            FFPROBE_PATH,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            val = float(stdout.decode().strip())
+            return max(0.0, val)
+    except Exception as e:
+        print_log(f"ffprobe再生時間取得エラー ({file_path}): {e}")
+    return 0.0
+
+async def ensure_track_duration(track):
+    """トラック情報にdurationがない場合、ffprobeで取得してキャッシュを更新する"""
+    duration = track.get("duration")
+    if duration is None or duration <= 0:
+        if os.path.exists(track.get("path", "")):
+            duration = await get_audio_duration(track["path"])
+            track["duration"] = duration
+            try:
+                cache = load_json(MUSIC_CACHE_FILE, {})
+                for guild_tracks in cache.values():
+                    for t in guild_tracks:
+                        if t.get("id") == track.get("id"):
+                            t["duration"] = duration
+                            break
+                save_json(MUSIC_CACHE_FILE, cache)
+            except Exception:
+                pass
+    return duration or 0.0
+
 def is_audio_attachment(attachment):
     if attachment.content_type and attachment.content_type.startswith("audio/"):
         return True
@@ -150,6 +193,8 @@ async def cache_music_attachment(guild_id, attachment, uploader_name):
         print_log(f"音楽キャッシュ保存エラー: {e}")
         return
 
+    duration = await get_audio_duration(local_path)
+
     cache = load_json(MUSIC_CACHE_FILE, {})
     tracks = cache.setdefault(str(guild_id), [])
     tracks.insert(0, {
@@ -158,6 +203,7 @@ async def cache_music_attachment(guild_id, attachment, uploader_name):
         "uploader": uploader_name,
         "uploaded_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "size": attachment.size,
+        "duration": duration,
         "path": local_path,
     })
 
@@ -170,7 +216,7 @@ async def cache_music_attachment(guild_id, attachment, uploader_name):
                 pass
 
     save_json(MUSIC_CACHE_FILE, cache)
-    print_log(f"音楽キャッシュ追加: {attachment.filename} (guild={guild_id})")
+    print_log(f"音楽キャッシュ追加: {attachment.filename} (guild={guild_id}, duration={duration:.1f}s)")
 
 # --- ユーティリティ ---
 async def send_embed(interaction, title, description, color=COLOR_NOTICE, ephemeral=False):
@@ -539,12 +585,186 @@ class MixingAudioSource(discord.AudioSource):
             except Exception:
                 pass
 
+class PausableAudioSource(discord.AudioSource):
+    """一時停止に対応したAudioSourceラッパー。一時停止中は無音フレームを返すことでミキサーのfinished判定を回避し、内部ソースの読み進めを停止する"""
+    def __init__(self, source):
+        self._source = source
+        self._is_paused = False
+        self._lock = threading.Lock()
+
+    def pause(self):
+        with self._lock:
+            self._is_paused = True
+
+    def resume(self):
+        with self._lock:
+            self._is_paused = False
+
+    @property
+    def is_paused(self):
+        with self._lock:
+            return self._is_paused
+
+    def read(self):
+        with self._lock:
+            if self._is_paused:
+                return SILENCE_FRAME
+        return self._source.read()
+
+    def cleanup(self):
+        with self._lock:
+            try:
+                self._source.cleanup()
+            except Exception:
+                pass
+
+    def is_opus(self):
+        return self._source.is_opus()
+
 # ギルドID -> 状態 (Botは単一プロセスでの単一/少数サーバー運用を想定しているが、
 # 音楽キャッシュ・再生まわりはサーバー単位で独立させる)
 guild_mixers = {}       # guild_id -> MixingAudioSource
-guild_music_slot = {}   # guild_id -> 現在再生中の音楽AudioSource ( /stop用 )
+guild_music_states = {} # guild_id -> MusicPlayerState
 guild_tts_queue = {}    # guild_id -> asyncio.Queue (TTSは従来通り逐次再生)
 guild_tts_tasks = {}    # guild_id -> asyncio.Task (TTSキューの消費タスク)
+
+class MusicPlayerState:
+    """各ギルドの音楽再生状況を保持・管理するクラス"""
+    def __init__(self, guild_id):
+        self.guild_id = guild_id
+        self.track = None
+        self.source = None              # PausableAudioSource
+        self.start_time = 0.0           # monotonic
+        self.total_paused_duration = 0.0
+        self.pause_start_time = 0.0
+        self.is_paused = False
+        self.auto_stop_task = None      # 3分放置タイムアウトタスク
+        self.progress_task = None       # 15秒おきプログレス更新タスク
+        self.message = None             # コントローラーの discord.Message
+        self.last_status = "idle"       # "idle", "playing", "paused", "stopped", "ended"
+
+    def get_elapsed_seconds(self):
+        if not self.track or self.start_time == 0.0:
+            return 0.0
+        if self.is_paused:
+            elapsed = self.pause_start_time - self.start_time - self.total_paused_duration
+        else:
+            elapsed = time.monotonic() - self.start_time - self.total_paused_duration
+        duration = self.track.get("duration", 0.0)
+        if duration > 0:
+            elapsed = min(elapsed, duration)
+        return max(0.0, elapsed)
+
+    def pause(self):
+        if not self.is_paused and self.source:
+            self.is_paused = True
+            self.pause_start_time = time.monotonic()
+            self.source.pause()
+            self.last_status = "paused"
+
+    def resume(self):
+        if self.is_paused and self.source:
+            self.is_paused = False
+            self.total_paused_duration += (time.monotonic() - self.pause_start_time)
+            self.source.resume()
+            self.last_status = "playing"
+            if self.auto_stop_task and not self.auto_stop_task.done():
+                self.auto_stop_task.cancel()
+                self.auto_stop_task = None
+
+    def cleanup_tasks(self):
+        if self.progress_task and not self.progress_task.done():
+            self.progress_task.cancel()
+            self.progress_task = None
+        if self.auto_stop_task and not self.auto_stop_task.done():
+            self.auto_stop_task.cancel()
+            self.auto_stop_task = None
+
+def get_cached_tracks(guild_id):
+    """サーバーにキャッシュされた音楽トラックリスト(存在確認済み)を取得"""
+    cache = load_json(MUSIC_CACHE_FILE, {})
+    return [t for t in cache.get(str(guild_id), []) if os.path.exists(t.get("path", ""))]
+
+def format_duration(seconds: float) -> str:
+    secs = int(max(0, seconds))
+    m, s = divmod(secs, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def render_progress_bar(current: float, total: float, bar_length: int = 16) -> str:
+    """ミニマル角括弧プログレスバー [████░░░░]"""
+    if total <= 0:
+        return f"[{'░' * bar_length}]"
+    ratio = max(0.0, min(1.0, current / total))
+    filled = int(round(bar_length * ratio))
+    empty = bar_length - filled
+    return f"[{'█' * filled}{'░' * empty}]"
+
+def build_music_embed(state=None, track=None, status=None):
+    """音楽プレイヤーのリッチEmbedを生成"""
+    if status is None:
+        status = state.last_status if state else "idle"
+    if track is None and state:
+        track = state.track
+
+    if status == "playing" and track:
+        curr = state.get_elapsed_seconds() if state else 0.0
+        total = track.get("duration", 0.0)
+        curr_str = format_duration(curr)
+        total_str = format_duration(total) if total > 0 else "--:--"
+        bar = render_progress_bar(curr, total, bar_length=16)
+
+        embed = discord.Embed(title="🎵  NOW PLAYING", color=COLOR_PLAYER)
+        embed.description = (
+            f"### **{track['filename']}**\n\n"
+            f"`▶`  `{curr_str}`  `{bar}`  `{total_str}`\n\n"
+            f"👤 **投稿者**: {track.get('uploader', '不明')}\n\n"
+            "🔄 15秒おきに自動更新"
+        )
+        return embed
+
+    elif status == "paused" and track:
+        curr = state.get_elapsed_seconds() if state else 0.0
+        total = track.get("duration", 0.0)
+        curr_str = format_duration(curr)
+        total_str = format_duration(total) if total > 0 else "--:--"
+        bar = render_progress_bar(curr, total, bar_length=16)
+
+        embed = discord.Embed(title="⏸️  PAUSED", color=COLOR_PAUSED)
+        embed.description = (
+            f"### **{track['filename']}**\n\n"
+            f"`⏸`  `{curr_str}`  `{bar}`  `{total_str}`\n\n"
+            f"👤 **投稿者**: {track.get('uploader', '不明')}\n\n"
+            "⚠️３分間の無操作で自動停止します"
+        )
+        return embed
+
+    elif status == "stopped":
+        embed = discord.Embed(title="⏹️  STOPPED", color=COLOR_IDLE)
+        embed.description = (
+            "再生を停止しました。\n"
+            "下のメニューから曲を選択すると再生を開始します。"
+        )
+        return embed
+
+    elif status == "ended":
+        embed = discord.Embed(title="🏁  TRACK FINISHED", color=COLOR_IDLE)
+        filename = track['filename'] if track else '曲'
+        embed.description = (
+            f"**{filename}** の再生が終了しました。\n"
+            "下のメニューから曲を選択すると再生を開始します。"
+        )
+        return embed
+
+    else:  # idle
+        embed = discord.Embed(title="🎵  MUSIC PLAYER", color=COLOR_IDLE)
+        embed.description = (
+            "キャッシュされた音楽をボイスチャンネルで再生します。\n"
+            "下のメニューから曲を選択してください。"
+        )
+        return embed
 
 def attach_mixer(vc):
     """ボイス接続時にミキサーを起動し、そのギルドの再生ハブとして登録する"""
@@ -558,7 +778,11 @@ def detach_mixer(guild_id):
     mixer = guild_mixers.pop(guild_id, None)
     if mixer:
         mixer.cleanup()
-    guild_music_slot.pop(guild_id, None)
+    state = guild_music_states.pop(guild_id, None)
+    if state:
+        state.cleanup_tasks()
+        if state.source:
+            state.source.cleanup()
     task = guild_tts_tasks.pop(guild_id, None)
     if task:
         task.cancel()
@@ -611,37 +835,251 @@ async def speak(vc, text, voice_name):
     if guild_id not in guild_tts_tasks or guild_tts_tasks[guild_id].done():
         guild_tts_tasks[guild_id] = asyncio.create_task(process_tts_queue(guild_id))
 
-async def play_track(guild, track):
+class MusicSelect(discord.ui.Select):
+    def __init__(self, guild_id, tracks):
+        options = [
+            discord.SelectOption(
+                label=track["filename"][:100],
+                description=f'{track["uploader"]} ・ {track["uploaded_at"][:16].replace("T", " ")}'[:100],
+                value=track["id"],
+            )
+            for track in tracks[:25]
+        ]
+        super().__init__(placeholder="🎵 再生する曲を選択", options=options, row=0)
+        self.guild_id = guild_id
+        self.tracks_by_id = {track["id"]: track for track in tracks}
+
+    async def callback(self, interaction: discord.Interaction):
+        track = self.tracks_by_id.get(self.values[0])
+        vc = interaction.guild.voice_client
+        if not track or not vc or not vc.is_connected():
+            await interaction.response.send_message("ボイスチャンネルに接続していないため再生できません。", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        await ensure_track_duration(track)
+
+        msg = interaction.message
+        await play_track(interaction.guild, track, message=msg)
+
+        state = guild_music_states.get(interaction.guild.id)
+        tracks = get_cached_tracks(interaction.guild.id)
+        embed = build_music_embed(state, track=track, status="playing")
+        view = MusicPlayerView(interaction.guild.id, tracks)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+class MusicPlayerView(discord.ui.View):
+    def __init__(self, guild_id, tracks):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.tracks = tracks
+
+        state = guild_music_states.get(guild_id)
+        is_playing = state and state.source is not None and not state.is_paused
+        is_paused = state and state.is_paused
+        has_active_track = is_playing or is_paused
+
+        # Row 0: 曲選択セレクト
+        if tracks:
+            self.add_item(MusicSelect(guild_id, tracks))
+
+        # Row 1: ボタン群
+        if is_paused:
+            self.pause_resume_btn = discord.ui.Button(
+                label="再開", emoji="▶️", style=discord.ButtonStyle.success, row=1, disabled=False
+            )
+            self.pause_resume_btn.callback = self.resume_callback
+        else:
+            self.pause_resume_btn = discord.ui.Button(
+                label="一時停止", emoji="⏸️", style=discord.ButtonStyle.secondary, row=1, disabled=not is_playing
+            )
+            self.pause_resume_btn.callback = self.pause_callback
+        self.add_item(self.pause_resume_btn)
+
+        self.stop_btn = discord.ui.Button(
+            label="停止", emoji="⏹️", style=discord.ButtonStyle.danger, row=1, disabled=not has_active_track
+        )
+        self.stop_btn.callback = self.stop_callback
+        self.add_item(self.stop_btn)
+
+    async def pause_callback(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("ボイスチャンネルに接続されていません。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await pause_track(interaction.guild)
+        state = guild_music_states.get(self.guild_id)
+        embed = build_music_embed(state, status="paused")
+        view = MusicPlayerView(self.guild_id, self.tracks)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+    async def resume_callback(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("ボイスチャンネルに接続されていないため再開できません。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        resumed = await resume_track(interaction.guild)
+        if not resumed:
+            await interaction.followup.send("再開できませんでした。再度曲を選択してください。", ephemeral=True)
+            return
+        state = guild_music_states.get(self.guild_id)
+        embed = build_music_embed(state, status="playing")
+        view = MusicPlayerView(self.guild_id, self.tracks)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+    async def stop_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await stop_track(interaction.guild, status="stopped")
+        state = guild_music_states.get(self.guild_id)
+        embed = build_music_embed(state, status="stopped")
+        view = MusicPlayerView(self.guild_id, self.tracks)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+def start_music_progress_loop(guild_id):
+    """15秒おきにプレイヤーEmbedのプログレスバーを更新するバックグラウンドタスク"""
+    state = guild_music_states.get(guild_id)
+    if not state:
+        return
+    if state.progress_task and not state.progress_task.done():
+        state.progress_task.cancel()
+
+    async def loop_coro():
+        try:
+            while True:
+                await asyncio.sleep(15)
+                curr_state = guild_music_states.get(guild_id)
+                if not curr_state or not curr_state.source or curr_state.is_paused:
+                    continue
+                if not curr_state.message:
+                    break
+
+                guild = client.get_guild(guild_id)
+                vc = guild.voice_client if guild else None
+                if not vc or not vc.is_connected():
+                    break
+
+                tracks = get_cached_tracks(guild_id)
+                embed = build_music_embed(curr_state, status="playing")
+                view = MusicPlayerView(guild_id, tracks)
+                try:
+                    await curr_state.message.edit(embed=embed, view=view)
+                except discord.NotFound:
+                    break
+                except discord.HTTPException as e:
+                    print_log(f"プログレス更新エラー (HTTP): {e}")
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    state.progress_task = asyncio.create_task(loop_coro())
+
+async def play_track(guild, track, message=None):
     """指定トラックをそのギルドの音楽スロットで再生する(既存の再生中トラックは差し替え)"""
     mixer = guild_mixers.get(guild.id)
     if mixer is None:
         return False
 
-    old_source = guild_music_slot.pop(guild.id, None)
-    if old_source is not None:
-        mixer.remove(old_source)
+    state = guild_music_states.setdefault(guild.id, MusicPlayerState(guild.id))
+    state.cleanup_tasks()
+
+    if state.source is not None:
+        mixer.remove(state.source)
+        state.source = None
 
     loop = asyncio.get_running_loop()
-    source = discord.FFmpegPCMAudio(track["path"], executable=FFMPEG_PATH)
+    raw_source = discord.FFmpegPCMAudio(track["path"], executable=FFMPEG_PATH)
+    source = PausableAudioSource(raw_source)
 
     def on_finished():
-        def clear():
-            if guild_music_slot.get(guild.id) is source:
-                guild_music_slot.pop(guild.id, None)
-        loop.call_soon_threadsafe(clear)
+        async def finish_coro():
+            curr_state = guild_music_states.get(guild.id)
+            if curr_state and curr_state.source is source:
+                curr_state.cleanup_tasks()
+                curr_state.last_status = "ended"
+                curr_state.source = None
+                if curr_state.message:
+                    try:
+                        tracks = get_cached_tracks(guild.id)
+                        embed = build_music_embed(curr_state, track=curr_state.track, status="ended")
+                        view = MusicPlayerView(guild.id, tracks)
+                        await curr_state.message.edit(embed=embed, view=view)
+                    except Exception:
+                        pass
+        asyncio.run_coroutine_threadsafe(finish_coro(), loop)
 
-    guild_music_slot[guild.id] = source
+    state.track = track
+    state.source = source
+    state.start_time = time.monotonic()
+    state.total_paused_duration = 0.0
+    state.is_paused = False
+    state.last_status = "playing"
+    if message:
+        state.message = message
+
     mixer.add(source, on_finished=on_finished, volume=MUSIC_VOLUME)
+    start_music_progress_loop(guild.id)
     return True
 
-async def stop_track(guild):
-    """再生中の音楽を停止する。何も再生していなければFalseを返す"""
-    source = guild_music_slot.pop(guild.id, None)
-    if source is None:
+async def pause_track(guild):
+    """再生中の音楽を一時停止する。3分放置タイマーをセット"""
+    state = guild_music_states.get(guild.id)
+    if not state or not state.source or state.is_paused:
         return False
+
+    state.pause()
+
+    # 3分放置で自動停止するタイマー
+    async def auto_stop_coro():
+        try:
+            await asyncio.sleep(180)
+            curr = guild_music_states.get(guild.id)
+            if curr and curr.is_paused and curr.source is state.source:
+                print_log(f"音楽再生: 一時停止タイムアウト(3分)のため自動停止 (guild={guild.id})")
+                await stop_track(guild, status="stopped")
+        except asyncio.CancelledError:
+            pass
+
+    state.auto_stop_task = asyncio.create_task(auto_stop_coro())
+    return True
+
+async def resume_track(guild):
+    """一時停止中の音楽を再開する"""
+    state = guild_music_states.get(guild.id)
+    if not state or not state.source or not state.is_paused:
+        return False
+
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return False
+
+    state.resume()
+    start_music_progress_loop(guild.id)
+    return True
+
+async def stop_track(guild, status="stopped"):
+    """再生中または一時停止中の音楽を停止する"""
+    state = guild_music_states.get(guild.id)
+    if not state:
+        return False
+
+    state.cleanup_tasks()
     mixer = guild_mixers.get(guild.id)
-    if mixer:
-        mixer.remove(source)
+    if state.source and mixer:
+        mixer.remove(state.source)
+    state.source = None
+    state.is_paused = False
+    state.last_status = status
+
+    if state.message:
+        try:
+            tracks = get_cached_tracks(guild.id)
+            embed = build_music_embed(state, status=status)
+            view = MusicPlayerView(guild.id, tracks)
+            await state.message.edit(embed=embed, view=view)
+        except Exception:
+            pass
     return True
 
 # --- 通知ロジック ---
@@ -667,8 +1105,7 @@ def get_connection_embed(text_channel_mention):
         f"{text_channel_mention}に接続しました。 \n\n"
         "**使用可能なコマンド:**\n"
         f"- {cmd_mention('leave')} - ボットを切断\n"
-        f"- {cmd_mention('play')} - キャッシュされた音楽を再生\n"
-        f"- {cmd_mention('stop')} - 音楽の再生を停止\n"
+        f"- {cmd_mention('music')} - 音楽プレイヤーを表示・操作\n"
         f"- {cmd_mention('voice')} - 読み上げボイスの変更\n"
         f"- {cmd_mention('set_channel')} - 自動接続の設定\n"
         f"- {cmd_mention('status')} - システム状況表示\n\n"
@@ -688,12 +1125,6 @@ def get_disconnect_embed(text_channel_mention):
         f"- {cmd_mention('status')} - システム状況表示\n\n"
         f"**更新情報:**\n`{VERSION}: {UPDATE_INFO}`"
     )
-    return embed
-
-def get_now_playing_embed(filename):
-    """音楽再生開始時の共通リッチEmbedオブジェクトを生成"""
-    embed = discord.Embed(title="音楽再生", color=COLOR_SUCCESS)
-    embed.description = f"**{filename}** を再生します。"
     return embed
 
 AUTO_DISCONNECT_GRACE_SECONDS = 3
@@ -751,61 +1182,25 @@ async def leave(interaction: discord.Interaction):
     else:
         await send_embed(interaction, "エラー", "接続していません。", COLOR_ERROR, True)
 
-class MusicSelect(discord.ui.Select):
-    def __init__(self, tracks):
-        options = [
-            discord.SelectOption(
-                label=track["filename"][:100],
-                description=f'{track["uploader"]} ・ {track["uploaded_at"][:16].replace("T", " ")}'[:100],
-                value=track["id"],
-            )
-            for track in tracks
-        ]
-        super().__init__(placeholder="再生する曲を選択", options=options)
-        self.tracks_by_id = {track["id"]: track for track in tracks}
-
-    async def callback(self, interaction: discord.Interaction):
-        track = self.tracks_by_id.get(self.values[0])
-        vc = interaction.guild.voice_client
-        if not track or not vc or not vc.is_connected():
-            await interaction.response.edit_message(content="再生できませんでした。", embed=None, view=None)
-            return
-        await play_track(interaction.guild, track)
-        await interaction.response.edit_message(content=None, embed=get_now_playing_embed(track["filename"]), view=None)
-
-class MusicView(discord.ui.View):
-    def __init__(self, tracks):
-        super().__init__(timeout=60)
-        self.add_item(MusicSelect(tracks))
-
-@client.tree.command(name='play', description='サーバーにキャッシュされた音楽を選んで再生します')
-async def play(interaction: discord.Interaction):
+@client.tree.command(name='music', description='音楽プレイヤーを表示し、曲の再生・一時停止・停止を操作します')
+async def music(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if not vc or not vc.is_connected():
-        await send_embed(interaction, "エラー", "ボイスチャンネルに接続していません。", COLOR_ERROR, True)
+        await send_embed(interaction, "エラー", "ボイスチャンネルに接続していません。先にボイスチャンネルへ参加してください。", COLOR_ERROR, True)
         return
 
-    cache = load_json(MUSIC_CACHE_FILE, {})
-    tracks = [t for t in cache.get(str(interaction.guild.id), []) if os.path.exists(t["path"])]
-
+    tracks = get_cached_tracks(interaction.guild.id)
     if not tracks:
-        await send_embed(interaction, "案内", "キャッシュされた音楽がありません。音楽ファイルをチャンネルに投稿するとキャッシュされます。", COLOR_NOTICE, True)
+        await send_embed(interaction, "案内", "キャッシュされた音楽がありません。音楽ファイルをチャンネルに投稿すると自動的にキャッシュされます。", COLOR_NOTICE, True)
         return
 
-    await interaction.response.send_message("再生する曲を選択してください。", view=MusicView(tracks))
+    state = guild_music_states.setdefault(interaction.guild.id, MusicPlayerState(interaction.guild.id))
+    embed = build_music_embed(state)
+    view = MusicPlayerView(interaction.guild.id, tracks)
 
-@client.tree.command(name='stop', description='再生中の音楽を停止します')
-async def stop(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_connected():
-        await send_embed(interaction, "エラー", "ボイスチャンネルに接続していません。", COLOR_ERROR, True)
-        return
-
-    stopped = await stop_track(interaction.guild)
-    if stopped:
-        await send_embed(interaction, "停止", "音楽の再生を停止しました。", COLOR_SUCCESS)
-    else:
-        await send_embed(interaction, "案内", "再生中の音楽はありません。", COLOR_NOTICE)
+    await interaction.response.send_message(embed=embed, view=view)
+    msg = await interaction.original_response()
+    state.message = msg
 
 @client.tree.command(name='set_channel', description='自動入室時の読み上げテキストチャンネルをここに設定します')
 @app_commands.checks.has_permissions(manage_channels=True)
