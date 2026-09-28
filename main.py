@@ -497,6 +497,8 @@ def get_tts_limit_embed(reset_ts):
         color=COLOR_ERROR
     )
 
+_word_counter_lock = threading.Lock()
+
 def check_and_update_tts_count(char_count):
     """月間TTS文字数を更新する。
     戻り値: (allowed: bool, just_reached: bool, current_count: int)
@@ -504,28 +506,29 @@ def check_and_update_tts_count(char_count):
     - just_reached: 今回の生成で初めて月間上限に達したか (通知用)
     - current_count: 更新後の月間文字数
     """
-    current_month = datetime.datetime.now().strftime("%Y-%m")
-    data = load_json(WORD_COUNTER_FILE, {"count": 0, "last_reset": current_month, "notified_limit": False, "last_vc_notice": 0})
+    with _word_counter_lock:
+        current_month = datetime.datetime.now().strftime("%Y-%m")
+        data = load_json(WORD_COUNTER_FILE, {"count": 0, "last_reset": current_month, "notified_limit": False, "last_vc_notice": 0})
 
-    if data.get("last_reset") != current_month:
-        print_log(f"月次リセット: {data.get('last_reset')} -> {current_month}")
-        data["count"] = 0
-        data["last_reset"] = current_month
-        data["notified_limit"] = False
-        data["last_vc_notice"] = 0
+        if data.get("last_reset") != current_month:
+            print_log(f"月次リセット: {data.get('last_reset')} -> {current_month}")
+            data["count"] = 0
+            data["last_reset"] = current_month
+            data["notified_limit"] = False
+            data["last_vc_notice"] = 0
 
-    current_count = data.get("count", 0)
-    if current_count >= TTS_MONTHLY_LIMIT:
-        return False, False, current_count
+        current_count = data.get("count", 0)
+        if current_count >= TTS_MONTHLY_LIMIT:
+            return False, False, current_count
 
-    data["count"] = current_count + char_count
-    just_reached = False
-    if data["count"] >= TTS_MONTHLY_LIMIT and not data.get("notified_limit", False):
-        data["notified_limit"] = True
-        just_reached = True
+        data["count"] = current_count + char_count
+        just_reached = False
+        if data["count"] >= TTS_MONTHLY_LIMIT and not data.get("notified_limit", False):
+            data["notified_limit"] = True
+            just_reached = True
 
-    save_json(WORD_COUNTER_FILE, data)
-    return True, just_reached, data["count"]
+        save_json(WORD_COUNTER_FILE, data)
+        return True, just_reached, data["count"]
 
 async def generate_audio_google(text, voice_name):
     """Google Cloud TTSで音声を合成する。月間上限到達時は (None, just_reached) を返す。"""
@@ -554,7 +557,10 @@ async def generate_audio_google(text, voice_name):
 # --- Bot クラス ---
 class KikimimiBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.all())
+        intents = discord.Intents.default()
+        intents.message_content = True  # メッセージ本文読み上げ用 (Privileged)
+        intents.members = True          # ユーザー表示名・メンション解決用 (Privileged)
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.connected_channel_id = None
         self.last_channel_speaker = {}
