@@ -14,6 +14,7 @@ import shutil
 import random
 import struct
 import threading
+from typing import Optional
 from collections import Counter
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
@@ -90,9 +91,13 @@ TTS_MONTHLY_LIMIT = int(os.getenv("TTS_MONTHLY_LIMIT", "1000000"))
 MAX_SPEAK_LENGTH = int(os.getenv("MAX_SPEAK_LENGTH", "150"))
 
 # 音楽キャッシュ設定 (サーバー単位、直近N件・合計サイズ上限で管理)
-MUSIC_CACHE_MAX_TRACKS = int(os.getenv("MUSIC_CACHE_MAX_TRACKS", "10"))
+MUSIC_SELECT_MAX_OPTIONS = 25  # Discordのセレクトメニューに表示できる選択肢の上限
+# メニューに表示できない曲が生まれないよう、保存件数の上限もメニュー上限に揃える
+MUSIC_CACHE_MAX_TRACKS = min(int(os.getenv("MUSIC_CACHE_MAX_TRACKS", str(MUSIC_SELECT_MAX_OPTIONS))), MUSIC_SELECT_MAX_OPTIONS)
 MUSIC_CACHE_MAX_MB = int(os.getenv("MUSIC_CACHE_MAX_MB", "200"))
-MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.05"))  # TTS音量を1.0とした相対比
+MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.05"))  # TTS音量を1.0とした相対比(初期値)
+MUSIC_VOLUME_MAX = float(os.getenv("MUSIC_VOLUME_MAX", "0.3"))  # ユーザーが設定できる上限(表示上の100%)
+MUSIC_VOLUME_STEP = 5  # ボタン1回あたりの増減(%)
 MUSIC_CACHE_DIR = os.path.join(BASE_DIR, "data", "music_cache")
 MUSIC_CACHE_FILE = os.path.join(BASE_DIR, "data", "music_cache.json")
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".aac"}
@@ -164,6 +169,33 @@ async def get_audio_duration(file_path):
         print_log(f"ffprobe再生時間取得エラー ({file_path}): {e}")
     return 0.0
 
+async def get_audio_title(file_path):
+    """ffprobeで音声ファイルのタイトルタグ(ID3等)を取得する。無ければNone"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            FFPROBE_PATH,
+            "-v", "error",
+            "-show_entries", "format_tags=title",
+            "-of", "json",
+            file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            tags = json.loads(stdout.decode("utf-8", errors="replace")).get("format", {}).get("tags", {})
+            # タグ名の大文字小文字はコンテナにより異なる(TITLE/title)
+            for key, value in tags.items():
+                if key.lower() == "title" and value.strip():
+                    return value.strip()
+    except Exception as e:
+        print_log(f"ffprobeタイトル取得エラー ({file_path}): {e}")
+    return None
+
+def track_display_name(track):
+    """表示用の曲名。タイトルタグがあればそれを優先する(Discordは添付ファイル名の日本語を削るため)"""
+    return track.get("title") or track["filename"]
+
 async def ensure_track_duration(track):
     """トラック情報にdurationがない場合、ffprobeで取得してキャッシュを更新する"""
     duration = track.get("duration")
@@ -198,8 +230,12 @@ async def cache_music_attachment(guild_id, attachment, uploader_name):
 
     guild_dir = os.path.join(MUSIC_CACHE_DIR, str(guild_id))
     os.makedirs(guild_dir, exist_ok=True)
-    safe_name = re.sub(r'[\\/:*?"<>|]', '_', attachment.filename)
-    local_path = os.path.join(guild_dir, f"{attachment.id}_{safe_name}")
+    # ローカル保存名はASCIIのみにする(日本語名だとロケール次第でffmpeg/ffprobeへのパス受け渡しに失敗するため)
+    # 表示用の元ファイル名はキャッシュJSONのfilenameに保持する
+    ext = os.path.splitext(attachment.filename)[1].lower()
+    if not re.fullmatch(r'\.[a-z0-9]{1,8}', ext):
+        ext = ""
+    local_path = os.path.join(guild_dir, f"{attachment.id}{ext}")
 
     try:
         await attachment.save(local_path)
@@ -208,12 +244,14 @@ async def cache_music_attachment(guild_id, attachment, uploader_name):
         return
 
     duration = await get_audio_duration(local_path)
+    title = await get_audio_title(local_path)
 
     cache = load_json(MUSIC_CACHE_FILE, {})
     tracks = cache.setdefault(str(guild_id), [])
     tracks.insert(0, {
         "id": str(attachment.id),
         "filename": attachment.filename,
+        "title": title,
         "uploader": uploader_name,
         "uploaded_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "size": attachment.size,
@@ -606,6 +644,7 @@ class MixingAudioSource(discord.AudioSource):
             pass
 
     def add(self, source, on_finished=None, volume=1.0):
+        # volumeは数値、または再生中の音量変更に追従させるための引数なしcallable
         with self._lock:
             self._sources.append((source, on_finished, volume))
 
@@ -633,7 +672,7 @@ class MixingAudioSource(discord.AudioSource):
                 continue
             if len(data) < FRAME_SIZE:
                 data = data + b"\x00" * (FRAME_SIZE - len(data))
-            frames.append((data, volume))
+            frames.append((data, volume() if callable(volume) else volume))
 
         if finished:
             with self._lock:
@@ -737,6 +776,12 @@ class MusicPlayerState:
         self.progress_task = None       # 15秒おきプログレス更新タスク
         self.message = None             # コントローラーの discord.Message
         self.last_status = "idle"       # "idle", "playing", "paused", "stopped", "ended"
+        # 音量は表示用の0-100%で保持(100% = MUSIC_VOLUME_MAX)。再起動で初期値に戻る
+        self.volume_pct = min(100, max(0, round(MUSIC_VOLUME / MUSIC_VOLUME_MAX * 100)))
+
+    def get_volume(self):
+        """ミキサーに渡す実際の係数(TTS=1.0との相対比)"""
+        return self.volume_pct / 100 * MUSIC_VOLUME_MAX
 
     def get_elapsed_seconds(self):
         if not self.track or self.start_time == 0.0:
@@ -813,9 +858,10 @@ def build_music_embed(state=None, track=None, status=None):
 
         embed = discord.Embed(title="🎵  NOW PLAYING", color=COLOR_PLAYER)
         embed.description = (
-            f"### **{track['filename']}**\n\n"
+            f"### **{discord.utils.escape_markdown(track_display_name(track))}**\n\n"
             f"`▶`  `{curr_str}`  `{bar}`  `{total_str}`\n\n"
-            f"👤 **投稿者**: {track.get('uploader', '不明')}\n\n"
+            f"👤 **投稿者**: {track.get('uploader', '不明')}\n"
+            f"🔊 **音量**: {state.volume_pct if state else 0}%\n\n"
             "🔄 15秒おきに自動更新"
         )
         return embed
@@ -829,9 +875,10 @@ def build_music_embed(state=None, track=None, status=None):
 
         embed = discord.Embed(title="⏸️  PAUSED", color=COLOR_PAUSED)
         embed.description = (
-            f"### **{track['filename']}**\n\n"
+            f"### **{discord.utils.escape_markdown(track_display_name(track))}**\n\n"
             f"`⏸`  `{curr_str}`  `{bar}`  `{total_str}`\n\n"
-            f"👤 **投稿者**: {track.get('uploader', '不明')}\n\n"
+            f"👤 **投稿者**: {track.get('uploader', '不明')}\n"
+            f"🔊 **音量**: {state.volume_pct if state else 0}%\n\n"
             "⚠️３分間の無操作で自動停止します"
         )
         return embed
@@ -846,7 +893,7 @@ def build_music_embed(state=None, track=None, status=None):
 
     elif status == "ended":
         embed = discord.Embed(title="🏁  TRACK FINISHED", color=COLOR_IDLE)
-        filename = track['filename'] if track else '曲'
+        filename = discord.utils.escape_markdown(track_display_name(track)) if track else '曲'
         embed.description = (
             f"**{filename}** の再生が終了しました。\n"
             "下のメニューから曲を選択すると再生を開始します。"
@@ -858,6 +905,7 @@ def build_music_embed(state=None, track=None, status=None):
         embed.description = (
             "キャッシュされた音楽をボイスチャンネルで再生します。\n"
             "下のメニューから曲を選択してください。"
+            + (f"\n\n🔊 **音量**: {state.volume_pct}%" if state else "")
         )
         return embed
 
@@ -954,11 +1002,11 @@ class MusicSelect(discord.ui.Select):
     def __init__(self, guild_id, tracks):
         options = [
             discord.SelectOption(
-                label=track["filename"][:100],
+                label=track_display_name(track)[:100],
                 description=f'{track["uploader"]} ・ {track["uploaded_at"][:16].replace("T", " ")}'[:100],
                 value=track["id"],
             )
-            for track in tracks[:25]
+            for track in tracks[:MUSIC_SELECT_MAX_OPTIONS]
         ]
         super().__init__(placeholder="🎵 再生する曲を選択", options=options, row=0)
         self.guild_id = guild_id
@@ -1016,6 +1064,35 @@ class MusicPlayerView(discord.ui.View):
         )
         self.stop_btn.callback = self.stop_callback
         self.add_item(self.stop_btn)
+
+        volume_pct = state.volume_pct if state else 0
+        self.vol_down_btn = discord.ui.Button(
+            label=f"-{MUSIC_VOLUME_STEP}%", emoji="🔉", style=discord.ButtonStyle.secondary, row=1,
+            disabled=volume_pct <= 0
+        )
+        self.vol_down_btn.callback = self.volume_down_callback
+        self.add_item(self.vol_down_btn)
+
+        self.vol_up_btn = discord.ui.Button(
+            label=f"+{MUSIC_VOLUME_STEP}%", emoji="🔊", style=discord.ButtonStyle.secondary, row=1,
+            disabled=volume_pct >= 100
+        )
+        self.vol_up_btn.callback = self.volume_up_callback
+        self.add_item(self.vol_up_btn)
+
+    async def _change_volume(self, interaction: discord.Interaction, delta):
+        await interaction.response.defer()
+        state = guild_music_states.setdefault(self.guild_id, MusicPlayerState(self.guild_id))
+        state.volume_pct = min(100, max(0, state.volume_pct + delta))
+        embed = build_music_embed(state)
+        view = MusicPlayerView(self.guild_id, self.tracks)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+    async def volume_down_callback(self, interaction: discord.Interaction):
+        await self._change_volume(interaction, -MUSIC_VOLUME_STEP)
+
+    async def volume_up_callback(self, interaction: discord.Interaction):
+        await self._change_volume(interaction, MUSIC_VOLUME_STEP)
 
     async def pause_callback(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
@@ -1133,7 +1210,7 @@ async def play_track(guild, track, message=None):
     if message:
         state.message = message
 
-    mixer.add(source, on_finished=on_finished, volume=MUSIC_VOLUME)
+    mixer.add(source, on_finished=on_finished, volume=state.get_volume)
     start_music_progress_loop(guild.id)
     return True
 
@@ -1303,8 +1380,9 @@ async def leave(interaction: discord.Interaction):
     else:
         await send_embed(interaction, "エラー", "接続していません。", COLOR_ERROR, True)
 
-@client.tree.command(name='music', description='音楽プレイヤーを表示し、曲の再生・一時停止・停止を操作します')
-async def music(interaction: discord.Interaction):
+@client.tree.command(name='music', description='音楽プレイヤーを表示し、曲の再生・一時停止・停止・音量調整を操作します')
+@app_commands.describe(volume='音量を0〜100%で設定します(省略時は現在の音量のまま)')
+async def music(interaction: discord.Interaction, volume: Optional[app_commands.Range[int, 0, 100]] = None):
     vc = interaction.guild.voice_client
     if not vc or not vc.is_connected():
         await send_embed(interaction, "エラー", "ボイスチャンネルに接続していません。先にボイスチャンネルへ参加してください。", COLOR_ERROR, True)
@@ -1316,6 +1394,8 @@ async def music(interaction: discord.Interaction):
         return
 
     state = guild_music_states.setdefault(interaction.guild.id, MusicPlayerState(interaction.guild.id))
+    if volume is not None:
+        state.volume_pct = volume
     embed = build_music_embed(state)
     view = MusicPlayerView(interaction.guild.id, tracks)
 
