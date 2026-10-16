@@ -155,6 +155,7 @@ async def get_audio_duration(file_path):
         proc = await asyncio.create_subprocess_exec(
             FFPROBE_PATH,
             "-v", "error",
+            "-protocol_whitelist", "file",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             file_path,
@@ -175,6 +176,7 @@ async def get_audio_title(file_path):
         proc = await asyncio.create_subprocess_exec(
             FFPROBE_PATH,
             "-v", "error",
+            "-protocol_whitelist", "file",
             "-show_entries", "format_tags=title",
             "-of", "json",
             file_path,
@@ -1181,7 +1183,7 @@ async def play_track(guild, track, message=None):
         state.source = None
 
     loop = asyncio.get_running_loop()
-    raw_source = discord.FFmpegPCMAudio(track["path"], executable=FFMPEG_PATH)
+    raw_source = discord.FFmpegPCMAudio(track["path"], executable=FFMPEG_PATH, before_options="-protocol_whitelist file")
     source = PausableAudioSource(raw_source)
 
     def on_finished():
