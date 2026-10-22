@@ -1,5 +1,4 @@
 import os
-import io
 import re
 import json
 import html
@@ -23,7 +22,6 @@ load_dotenv()
 
 import psutil
 import requests
-from pydub import AudioSegment
 
 import discord
 from discord.ext import commands
@@ -105,6 +103,8 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".opus", ".aac"}
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = KEY_PATH
 FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 FFPROBE_PATH = shutil.which("ffprobe") or "/usr/bin/ffprobe"
+FFMPEG_FORMAT_WHITELIST = "mp3,wav,ogg,mov,mp4,m4a,3gp,3g2,mj2,flac,aac"
+FFPROBE_TIMEOUT_SECONDS = 10
 
 # --- ログ設定 ---
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -151,39 +151,45 @@ def save_json(path, data):
 # --- 音楽キャッシュ ---
 async def get_audio_duration(file_path):
     """ffprobeを使用して音声ファイルの総再生時間(秒)を取得する"""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             FFPROBE_PATH,
             "-v", "error",
             "-protocol_whitelist", "file",
+            "-format_whitelist", FFMPEG_FORMAT_WHITELIST,
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             file_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT_SECONDS)
         if proc.returncode == 0 and stdout:
             val = float(stdout.decode().strip())
             return max(0.0, val)
     except Exception as e:
+        if proc and proc.returncode is None:
+            proc.kill()
         print_log(f"ffprobe再生時間取得エラー ({file_path}): {e}")
     return 0.0
 
 async def get_audio_title(file_path):
     """ffprobeで音声ファイルのタイトルタグ(ID3等)を取得する。無ければNone"""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             FFPROBE_PATH,
             "-v", "error",
             "-protocol_whitelist", "file",
+            "-format_whitelist", FFMPEG_FORMAT_WHITELIST,
             "-show_entries", "format_tags=title",
             "-of", "json",
             file_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT_SECONDS)
         if proc.returncode == 0 and stdout:
             tags = json.loads(stdout.decode("utf-8", errors="replace")).get("format", {}).get("tags", {})
             # タグ名の大文字小文字はコンテナにより異なる(TITLE/title)
@@ -191,6 +197,8 @@ async def get_audio_title(file_path):
                 if key.lower() == "title" and value.strip():
                     return value.strip()
     except Exception as e:
+        if proc and proc.returncode is None:
+            proc.kill()
         print_log(f"ffprobeタイトル取得エラー ({file_path}): {e}")
     return None
 
@@ -341,20 +349,93 @@ PRIVATE_IP_NETWORKS = [ipaddress.ip_network(n) for n in (
     "::1/128", "fc00::/7", "fe80::/10",
 )]
 
-def _is_public_hostname(hostname):
+def _is_public_ip(ip_str):
     try:
-        infos = socket.getaddrinfo(hostname, None)
-    except Exception:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
         return False
-    if not infos:
-        return False
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-            return False
-        if any(ip in net for net in PRIVATE_IP_NETWORKS):
+    # IPv6 に埋め込まれた IPv4 アドレス (IPv4-mapped / 6to4 / Teredo) も展開して検証する
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped:
+            candidates.append(ip.ipv4_mapped)
+        if ip.sixtofour:
+            candidates.append(ip.sixtofour)
+        if ip.teredo:
+            candidates.extend(ip.teredo)
+    for addr in candidates:
+        if (
+            not addr.is_global
+            or addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+            or any(addr in net for net in PRIVATE_IP_NETWORKS)
+        ):
             return False
     return True
+
+def _resolve_public_ip(hostname):
+    """ホスト名を解決し、全ての解決先がグローバルIPである場合のみ先頭IPを返す (SSRF対策)"""
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except Exception:
+        return None
+    if not infos:
+        return None
+    resolved_ips = []
+    for info in infos:
+        ip_str = info[4][0]
+        if not _is_public_ip(ip_str):
+            return None
+        resolved_ips.append(ip_str)
+    return resolved_ips[0]
+
+def _is_public_hostname(hostname):
+    return _resolve_public_ip(hostname) is not None
+
+class _PinnedHTTPAdapter(requests.adapters.HTTPAdapter):
+    """DNS Rebinding (TOCTOU) 防止のため、検証済みIPアドレスへ直接TCP接続しつつHostヘッダ・TLS SNIを維持するアダプター"""
+    def __init__(self, pinned_ip, *args, **kwargs):
+        self.pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+        pinned_ip = self.pinned_ip
+        http_pool_cls = self.poolmanager.pool_classes_by_scheme["http"]
+        https_pool_cls = self.poolmanager.pool_classes_by_scheme["https"]
+
+        class _PinnedHTTPConnection(http_pool_cls.ConnectionCls):
+            def _new_conn(self):
+                orig = self._dns_host
+                self._dns_host = pinned_ip
+                try:
+                    return super()._new_conn()
+                finally:
+                    self._dns_host = orig
+
+        class _PinnedHTTPSConnection(https_pool_cls.ConnectionCls):
+            def _new_conn(self):
+                orig = self._dns_host
+                self._dns_host = pinned_ip
+                try:
+                    return super()._new_conn()
+                finally:
+                    self._dns_host = orig
+
+        class _PinnedHTTPPool(http_pool_cls):
+            ConnectionCls = _PinnedHTTPConnection
+
+        class _PinnedHTTPSPool(https_pool_cls):
+            ConnectionCls = _PinnedHTTPSConnection
+
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _PinnedHTTPPool,
+            "https": _PinnedHTTPSPool,
+        }
 
 def _decode_html(raw_bytes, header_encoding):
     for enc in filter(None, [header_encoding, "utf-8", "shift_jis", "euc-jp", "cp932"]):
@@ -371,29 +452,32 @@ def fetch_page_title(url):
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             return None
-        if not _is_public_hostname(parsed.hostname):
+        pinned_ip = _resolve_public_ip(parsed.hostname)
+        if not pinned_ip:
             return None
         try:
-            resp = requests.get(url, headers=headers, timeout=LINK_FETCH_TIMEOUT, stream=True, allow_redirects=False)
+            with requests.Session() as session:
+                adapter = _PinnedHTTPAdapter(pinned_ip)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                resp = session.get(url, headers=headers, timeout=LINK_FETCH_TIMEOUT, stream=True, allow_redirects=False)
+                try:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
+                            return None
+                        url = urljoin(url, location)
+                        continue
+                    if resp.status_code != 200:
+                        return None
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "html" not in content_type.lower():
+                        return None
+                    raw = resp.raw.read(LINK_MAX_BYTES, decode_content=True)
+                finally:
+                    resp.close()
         except Exception:
             return None
-        try:
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("Location")
-                if not location:
-                    return None
-                url = urljoin(url, location)
-                continue
-            if resp.status_code != 200:
-                return None
-            content_type = resp.headers.get("Content-Type", "")
-            if "html" not in content_type.lower():
-                return None
-            raw = resp.raw.read(LINK_MAX_BYTES, decode_content=True)
-        except Exception:
-            return None
-        finally:
-            resp.close()
 
         decoded = _decode_html(raw, resp.encoding)
         match = TITLE_TAG_PATTERN.search(decoded)
@@ -586,8 +670,7 @@ async def generate_audio_google(text, voice_name):
             v_params = texttospeech.VoiceSelectionParams(language_code="ja-JP", name=voice_name)
             a_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
             response = client_tts.synthesize_speech(input=s_input, voice=v_params, audio_config=a_config)
-            audio = AudioSegment.from_file(io.BytesIO(response.audio_content), format="mp3")
-            return audio, just_reached
+            return response.audio_content, just_reached
         except Exception as e:
             print_log(f"Google TTS API エラー: {e}")
             return None, False
@@ -602,7 +685,7 @@ class KikimimiBot(discord.Client):
         intents.members = True          # ユーザー表示名・メンション解決用 (Privileged)
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.connected_channel_id = None
+        self.connected_channel_ids = {}
         self.last_channel_speaker = {}
         self.command_ids = {}
 
@@ -943,10 +1026,10 @@ async def process_tts_queue(guild_id):
                 continue
             temp_path = None
             try:
-                audio, just_reached = await generate_audio_google(text, voice_name)
+                audio_bytes, just_reached = await generate_audio_google(text, voice_name)
 
                 if just_reached:
-                    channel_id = client.connected_channel_id
+                    channel_id = client.connected_channel_ids.get(guild_id)
                     if channel_id:
                         channel = client.get_channel(channel_id)
                         if channel:
@@ -958,17 +1041,21 @@ async def process_tts_queue(guild_id):
                     if guild and guild.voice_client:
                         detach_mixer(guild_id)
                         asyncio.create_task(guild.voice_client.disconnect())
-                        client.connected_channel_id = None
+                        client.connected_channel_ids.pop(guild_id, None)
                     continue
 
-                if audio is None:
+                if audio_bytes is None:
                     continue
 
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                    audio.export(f.name, format="mp3")
+                    f.write(audio_bytes)
                     temp_path = f.name
 
-                source = discord.FFmpegPCMAudio(temp_path, executable=FFMPEG_PATH)
+                source = discord.FFmpegPCMAudio(
+                    temp_path,
+                    executable=FFMPEG_PATH,
+                    before_options="-protocol_whitelist file -format_whitelist mp3"
+                )
                 finished = asyncio.Event()
                 loop = asyncio.get_running_loop()
 
@@ -1183,7 +1270,11 @@ async def play_track(guild, track, message=None):
         state.source = None
 
     loop = asyncio.get_running_loop()
-    raw_source = discord.FFmpegPCMAudio(track["path"], executable=FFMPEG_PATH, before_options="-protocol_whitelist file")
+    raw_source = discord.FFmpegPCMAudio(
+        track["path"],
+        executable=FFMPEG_PATH,
+        before_options=f"-protocol_whitelist file -format_whitelist {FFMPEG_FORMAT_WHITELIST}"
+    )
     source = PausableAudioSource(raw_source)
 
     def on_finished():
@@ -1334,14 +1425,14 @@ async def schedule_auto_disconnect(guild, channel_id):
         return
 
     channel_name = vc.channel.name
-    text_channel = client.get_channel(client.connected_channel_id)
+    text_channel = client.get_channel(client.connected_channel_ids.get(guild.id))
     mention = text_channel.mention if text_channel else "テキストチャンネル"
     detach_mixer(guild.id)
     await vc.disconnect()
     if text_channel:
         embed = get_disconnect_embed(mention)
         await text_channel.send(embed=embed)
-    client.connected_channel_id = None
+    client.connected_channel_ids.pop(guild.id, None)
     print_log(f"自動切断: {channel_name}")
 
 # --- コマンド ---
@@ -1362,7 +1453,7 @@ async def join(interaction: discord.Interaction):
     try:
         vc = await channel.connect(timeout=10)
         attach_mixer(vc)
-        client.connected_channel_id = interaction.channel_id
+        client.connected_channel_ids[interaction.guild.id] = interaction.channel_id
 
         embed = get_connection_embed(interaction.channel.mention)
         await interaction.followup.send(embed=embed)
@@ -1378,7 +1469,7 @@ async def leave(interaction: discord.Interaction):
         await interaction.guild.voice_client.disconnect()
         embed = get_disconnect_embed(mention)
         await interaction.response.send_message(embed=embed)
-        client.connected_channel_id = None
+        client.connected_channel_ids.pop(interaction.guild.id, None)
     else:
         await send_embed(interaction, "エラー", "接続していません。", COLOR_ERROR, True)
 
@@ -1490,7 +1581,7 @@ async def on_message(message):
         body = body[:MAX_SPEAK_LENGTH] + "、以下略"
 
     channel_id = message.channel.id
-    is_home_channel = channel_id == client.connected_channel_id
+    is_home_channel = channel_id == client.connected_channel_ids.get(message.guild.id)
 
     if is_home_channel:
         final_text = body
@@ -1566,7 +1657,7 @@ async def on_voice_state_update(member, before, after):
                       member.guild.system_channel or \
                       member.guild.text_channels[0]
             
-            client.connected_channel_id = text_ch.id
+            client.connected_channel_ids[member.guild.id] = text_ch.id
             
             embed = get_connection_embed(text_ch.mention)
             await text_ch.send(embed=embed)

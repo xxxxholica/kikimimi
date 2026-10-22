@@ -1,7 +1,6 @@
-discord.py[voice]
-google-cloud-texttospeech
-pydub
-psutil
-python-dotenv
-requests
-pynacl
+discord.py[voice]==2.7.1
+google-cloud-texttospeech==2.38.0
+psutil==7.2.2
+python-dotenv==1.2.4
+requests==2.34.2
+pynacl==1.6.2
