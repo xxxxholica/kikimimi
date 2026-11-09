@@ -206,6 +206,27 @@ def track_display_name(track):
     """表示用の曲名。タイトルタグがあればそれを優先する(Discordは添付ファイル名の日本語を削るため)"""
     return track.get("title") or track["filename"]
 
+def track_file_path(track, guild_id):
+    """キャッシュJSONの path を実ファイルのパスに解決する。
+
+    新しい形式は MUSIC_CACHE_DIR からの相対パス(設置ディレクトリを移しても壊れない)。
+    以前の形式の絶対パスはそのまま使い、無ければ(設置ディレクトリを移した場合など)
+    MUSIC_CACHE_DIR/<guild_id>/<ファイル名> を探す。解決できなければ空文字を返す。
+    """
+    stored = track.get("path") or ""
+    if not stored:
+        return ""
+    if not os.path.isabs(stored):
+        resolved = os.path.normpath(os.path.join(MUSIC_CACHE_DIR, stored))
+        # MUSIC_CACHE_DIR の外を指す値(../ など)は使わない
+        if os.path.commonpath([resolved, MUSIC_CACHE_DIR]) != MUSIC_CACHE_DIR:
+            return ""
+        return resolved if os.path.exists(resolved) else ""
+    if os.path.exists(stored):
+        return stored
+    candidate = os.path.join(MUSIC_CACHE_DIR, str(guild_id), os.path.basename(stored))
+    return candidate if os.path.exists(candidate) else ""
+
 async def ensure_track_duration(track):
     """トラック情報にdurationがない場合、ffprobeで取得してキャッシュを更新する"""
     duration = track.get("duration")
@@ -266,14 +287,16 @@ async def cache_music_attachment(guild_id, attachment, uploader_name):
         "uploaded_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "size": attachment.size,
         "duration": duration,
-        "path": local_path,
+        # MUSIC_CACHE_DIR からの相対パスで保存する(track_file_path で解決する)
+        "path": os.path.relpath(local_path, MUSIC_CACHE_DIR),
     })
 
     while len(tracks) > MUSIC_CACHE_MAX_TRACKS or sum(t["size"] for t in tracks) > max_bytes:
         removed = tracks.pop()
-        if os.path.exists(removed["path"]):
+        removed_path = track_file_path(removed, guild_id)
+        if removed_path:
             try:
-                os.remove(removed["path"])
+                os.remove(removed_path)
             except OSError:
                 pass
 
@@ -906,9 +929,17 @@ class MusicPlayerState:
             self.auto_stop_task = None
 
 def get_cached_tracks(guild_id):
-    """サーバーにキャッシュされた音楽トラックリスト(存在確認済み)を取得"""
+    """サーバーにキャッシュされた音楽トラックリスト(存在確認済み)を取得。
+
+    返す各トラックの path は実ファイルの絶対パスに解決済み(JSON 側は書き換えない)。
+    """
     cache = load_json(MUSIC_CACHE_FILE, {})
-    return [t for t in cache.get(str(guild_id), []) if os.path.exists(t.get("path", ""))]
+    tracks = []
+    for t in cache.get(str(guild_id), []):
+        path = track_file_path(t, guild_id)
+        if path:
+            tracks.append({**t, "path": path})
+    return tracks
 
 def format_duration(seconds: float) -> str:
     secs = int(max(0, seconds))
