@@ -24,7 +24,6 @@ import psutil
 import requests
 
 import discord
-from discord.ext import commands
 from discord import app_commands
 import discord.opus
 from google.cloud import texttospeech
@@ -41,7 +40,6 @@ COLOR_IDLE = 0x2b2d31     # 音楽待機/停止 (スレートグレー)
 # カスタマイズ設定 (環境変数から取得)
 VERSION = os.getenv("VERSION", "v1.2.0")
 UPDATE_INFO = os.getenv("UPDATE_INFO", "音楽再生機能を追加。読み上げと同時再生や/musicのプログレスバーUIに対応。")
-SYSTEM_FOOTER = os.getenv("SYSTEM_FOOTER", "Discord Bot System")
 BOT_PRESENCE = os.getenv("BOT_PRESENCE", "github.com/xxxxholica/kikimimi")
 
 # システム案内用
@@ -149,8 +147,8 @@ def save_json(path, data):
                 pass
 
 # --- 音楽キャッシュ ---
-async def get_audio_duration(file_path):
-    """ffprobeを使用して音声ファイルの総再生時間(秒)を取得する"""
+async def _run_ffprobe(file_path, *extra_args):
+    """ffprobeを安全オプション・タイムアウト付きで実行し、標準出力(bytes)を返す。失敗時はNone"""
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -158,48 +156,50 @@ async def get_audio_duration(file_path):
             "-v", "error",
             "-protocol_whitelist", "file",
             "-format_whitelist", FFMPEG_FORMAT_WHITELIST,
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            *extra_args,
             file_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT_SECONDS)
         if proc.returncode == 0 and stdout:
-            val = float(stdout.decode().strip())
-            return max(0.0, val)
+            return stdout
     except Exception as e:
         if proc and proc.returncode is None:
             proc.kill()
-        print_log(f"ffprobe再生時間取得エラー ({file_path}): {e}")
+        print_log(f"ffprobe実行エラー ({file_path}): {e}")
+    return None
+
+async def get_audio_duration(file_path):
+    """ffprobeを使用して音声ファイルの総再生時間(秒)を取得する"""
+    stdout = await _run_ffprobe(
+        file_path,
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1"
+    )
+    if stdout:
+        try:
+            return max(0.0, float(stdout.decode().strip()))
+        except ValueError as e:
+            print_log(f"ffprobe再生時間解析エラー ({file_path}): {e}")
     return 0.0
 
 async def get_audio_title(file_path):
     """ffprobeで音声ファイルのタイトルタグ(ID3等)を取得する。無ければNone"""
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            FFPROBE_PATH,
-            "-v", "error",
-            "-protocol_whitelist", "file",
-            "-format_whitelist", FFMPEG_FORMAT_WHITELIST,
-            "-show_entries", "format_tags=title",
-            "-of", "json",
-            file_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT_SECONDS)
-        if proc.returncode == 0 and stdout:
+    stdout = await _run_ffprobe(
+        file_path,
+        "-show_entries", "format_tags=title",
+        "-of", "json"
+    )
+    if stdout:
+        try:
             tags = json.loads(stdout.decode("utf-8", errors="replace")).get("format", {}).get("tags", {})
             # タグ名の大文字小文字はコンテナにより異なる(TITLE/title)
             for key, value in tags.items():
                 if key.lower() == "title" and value.strip():
                     return value.strip()
-    except Exception as e:
-        if proc and proc.returncode is None:
-            proc.kill()
-        print_log(f"ffprobeタイトル取得エラー ({file_path}): {e}")
+        except Exception as e:
+            print_log(f"ffprobeタイトル解析エラー ({file_path}): {e}")
     return None
 
 def track_display_name(track):
@@ -322,6 +322,7 @@ MAX_TITLE_LENGTH = 50
 LINK_FETCH_TIMEOUT = 4
 LINK_MAX_REDIRECTS = 3
 LINK_MAX_BYTES = 262144
+LINK_MAX_PER_MESSAGE = 5
 
 KNOWN_SITE_LABELS = {
     "store.steampowered.com": "スチーム", "steampowered.com": "スチーム",
@@ -416,9 +417,6 @@ def _resolve_public_ip(hostname):
         resolved_ips.append(ip_str)
     return resolved_ips[0]
 
-def _is_public_hostname(hostname):
-    return _resolve_public_ip(hostname) is not None
-
 class _PinnedHTTPAdapter(requests.adapters.HTTPAdapter):
     """DNS Rebinding (TOCTOU) 防止のため、検証済みIPアドレスへ直接TCP接続しつつHostヘッダ・TLS SNIを維持するアダプター"""
     def __init__(self, pinned_ip, *args, **kwargs):
@@ -431,16 +429,7 @@ class _PinnedHTTPAdapter(requests.adapters.HTTPAdapter):
         http_pool_cls = self.poolmanager.pool_classes_by_scheme["http"]
         https_pool_cls = self.poolmanager.pool_classes_by_scheme["https"]
 
-        class _PinnedHTTPConnection(http_pool_cls.ConnectionCls):
-            def _new_conn(self):
-                orig = self._dns_host
-                self._dns_host = pinned_ip
-                try:
-                    return super()._new_conn()
-                finally:
-                    self._dns_host = orig
-
-        class _PinnedHTTPSConnection(https_pool_cls.ConnectionCls):
+        class _PinnedConnMixin:
             def _new_conn(self):
                 orig = self._dns_host
                 self._dns_host = pinned_ip
@@ -450,10 +439,10 @@ class _PinnedHTTPAdapter(requests.adapters.HTTPAdapter):
                     self._dns_host = orig
 
         class _PinnedHTTPPool(http_pool_cls):
-            ConnectionCls = _PinnedHTTPConnection
+            ConnectionCls = type("_PinnedHTTPConnection", (_PinnedConnMixin, http_pool_cls.ConnectionCls), {})
 
         class _PinnedHTTPSPool(https_pool_cls):
-            ConnectionCls = _PinnedHTTPSConnection
+            ConnectionCls = type("_PinnedHTTPSConnection", (_PinnedConnMixin, https_pool_cls.ConnectionCls), {})
 
         self.poolmanager.pool_classes_by_scheme = {
             "http": _PinnedHTTPPool,
@@ -480,6 +469,7 @@ def fetch_page_title(url):
             return None
         try:
             with requests.Session() as session:
+                session.trust_env = False
                 adapter = _PinnedHTTPAdapter(pinned_ip)
                 session.mount("http://", adapter)
                 session.mount("https://", adapter)
@@ -506,9 +496,7 @@ def fetch_page_title(url):
         match = TITLE_TAG_PATTERN.search(decoded)
         if not match:
             return None
-        title = html.unescape(match.group(1))
-        title = re.sub(r'\s+', ' ', title).strip()
-        return title[:MAX_TITLE_LENGTH] if title else None
+        return html.unescape(match.group(1)).strip() or None
     return None
 
 DISCORD_EMBED_WAIT_TIMEOUT = 3.0
@@ -542,18 +530,19 @@ async def wait_for_discord_embed_title(message, url, solo_link):
     except asyncio.TimeoutError:
         return None
 
-async def resolve_link_label(url, loop, message, solo_link):
+async def resolve_link_label(url, loop, message, solo_link, fetch_title=True):
     parsed_url = urlparse(url)
     known = lookup_known_label(parsed_url.netloc)
     if known:
         return f"{known}省略"
 
-    title = await wait_for_discord_embed_title(message, url, solo_link)
-    if not title:
-        title = await loop.run_in_executor(None, fetch_page_title, url)
-    if title:
-        title = re.sub(r'\s+', ' ', title).strip()[:MAX_TITLE_LENGTH]
-        return f"リンク省略({title})"
+    if fetch_title:
+        title = await wait_for_discord_embed_title(message, url, solo_link)
+        if not title:
+            title = await loop.run_in_executor(None, fetch_page_title, url)
+        if title:
+            title = re.sub(r'\s+', ' ', title).strip()[:MAX_TITLE_LENGTH]
+            return f"リンク省略({title})"
     return f"リンク省略。{extract_base_domain(parsed_url.hostname or parsed_url.netloc)}"
 
 async def resolve_links(text, message):
@@ -562,10 +551,16 @@ async def resolve_links(text, message):
         return text
     loop = asyncio.get_running_loop()
     solo_link = len(urls) == 1
-    labels = await asyncio.gather(*(resolve_link_label(url, loop, message, solo_link) for url in urls))
+    labels = await asyncio.gather(*(
+        resolve_link_label(url, loop, message, solo_link, fetch_title=(i < LINK_MAX_PER_MESSAGE))
+        for i, url in enumerate(urls)
+    ))
     for url, label in zip(urls, labels):
         text = text.replace(url, label)
     return text
+
+def lowercase_ascii(text):
+    return re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), text)
 
 def preprocess_text(text, guild):
     if not text:
@@ -595,8 +590,7 @@ def preprocess_text(text, guild):
 async def clean_text(text, guild, message):
     text = preprocess_text(text, guild)
     text = await resolve_links(text, message)
-    text = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), text)
-    return text
+    return lowercase_ascii(text)
 
 # --- TTS エンジン ---
 _tts_client = None
@@ -616,12 +610,15 @@ def get_next_reset_timestamp():
         next_month = datetime.datetime(now.year, now.month + 1, 1, 0, 0, 0)
     return int(next_month.timestamp())
 
-def get_tts_status():
-    """現在の月間TTS状態を取得・更新する。
-    戻り値: (is_limited: bool, count: int, reset_ts: int)
-    """
+_word_counter_lock = threading.Lock()
+
+def _load_word_counter():
+    """月次リセット判定込みでTTS文字数カウンタを読み込む(_word_counter_lock保持下で呼ぶこと)"""
     current_month = datetime.datetime.now().strftime("%Y-%m")
-    data = load_json(WORD_COUNTER_FILE, {"count": 0, "last_reset": current_month, "notified_limit": False, "last_vc_notice": 0})
+    data = load_json(
+        WORD_COUNTER_FILE,
+        {"count": 0, "last_reset": current_month, "notified_limit": False, "last_vc_notice": 0}
+    )
     if data.get("last_reset") != current_month:
         print_log(f"月次リセット: {data.get('last_reset')} -> {current_month}")
         data["count"] = 0
@@ -629,9 +626,16 @@ def get_tts_status():
         data["notified_limit"] = False
         data["last_vc_notice"] = 0
         save_json(WORD_COUNTER_FILE, data)
+    return data
 
-    is_limited = data.get("count", 0) >= TTS_MONTHLY_LIMIT
-    return is_limited, data.get("count", 0), get_next_reset_timestamp()
+def get_tts_status():
+    """現在の月間TTS状態を取得・更新する。
+    戻り値: (is_limited: bool, count: int, reset_ts: int)
+    """
+    with _word_counter_lock:
+        data = _load_word_counter()
+    count = data.get("count", 0)
+    return count >= TTS_MONTHLY_LIMIT, count, get_next_reset_timestamp()
 
 def get_tts_limit_embed(reset_ts):
     """月間TTS上限到達時の共通Embedを生成"""
@@ -644,7 +648,16 @@ def get_tts_limit_embed(reset_ts):
         color=COLOR_ERROR
     )
 
-_word_counter_lock = threading.Lock()
+def should_send_vc_limit_notice():
+    """自動接続時の上限通知を送信すべきか判定し、送信時刻を記録する(24時間に1回まで)"""
+    with _word_counter_lock:
+        data = _load_word_counter()
+        now_ts = int(time.time())
+        if now_ts - data.get("last_vc_notice", 0) < 86400:
+            return False
+        data["last_vc_notice"] = now_ts
+        save_json(WORD_COUNTER_FILE, data)
+        return True
 
 def check_and_update_tts_count(char_count):
     """月間TTS文字数を更新する。
@@ -654,16 +667,7 @@ def check_and_update_tts_count(char_count):
     - current_count: 更新後の月間文字数
     """
     with _word_counter_lock:
-        current_month = datetime.datetime.now().strftime("%Y-%m")
-        data = load_json(WORD_COUNTER_FILE, {"count": 0, "last_reset": current_month, "notified_limit": False, "last_vc_notice": 0})
-
-        if data.get("last_reset") != current_month:
-            print_log(f"月次リセット: {data.get('last_reset')} -> {current_month}")
-            data["count"] = 0
-            data["last_reset"] = current_month
-            data["notified_limit"] = False
-            data["last_vc_notice"] = 0
-
+        data = _load_word_counter()
         current_count = data.get("count", 0)
         if current_count >= TTS_MONTHLY_LIMIT:
             return False, False, current_count
@@ -965,37 +969,25 @@ def build_music_embed(state=None, track=None, status=None):
     if track is None and state:
         track = state.track
 
-    if status == "playing" and track:
+    if status in ("playing", "paused") and track:
+        is_playing = status == "playing"
         curr = state.get_elapsed_seconds() if state else 0.0
         total = track.get("duration", 0.0)
         curr_str = format_duration(curr)
         total_str = format_duration(total) if total > 0 else "--:--"
         bar = render_progress_bar(curr, total, bar_length=16)
+        title = "🎵  NOW PLAYING" if is_playing else "⏸️  PAUSED"
+        color = COLOR_PLAYER if is_playing else COLOR_PAUSED
+        icon = "▶" if is_playing else "⏸"
+        note = "🔄 15秒おきに自動更新" if is_playing else "⚠️３分間の無操作で自動停止します"
 
-        embed = discord.Embed(title="🎵  NOW PLAYING", color=COLOR_PLAYER)
+        embed = discord.Embed(title=title, color=color)
         embed.description = (
             f"### **{discord.utils.escape_markdown(track_display_name(track))}**\n\n"
-            f"`▶`  `{curr_str}`  `{bar}`  `{total_str}`\n\n"
+            f"`{icon}`  `{curr_str}`  `{bar}`  `{total_str}`\n\n"
             f"👤 **投稿者**: {track.get('uploader', '不明')}\n"
             f"🔊 **音量**: {state.volume_pct if state else 0}%\n\n"
-            "🔄 15秒おきに自動更新"
-        )
-        return embed
-
-    elif status == "paused" and track:
-        curr = state.get_elapsed_seconds() if state else 0.0
-        total = track.get("duration", 0.0)
-        curr_str = format_duration(curr)
-        total_str = format_duration(total) if total > 0 else "--:--"
-        bar = render_progress_bar(curr, total, bar_length=16)
-
-        embed = discord.Embed(title="⏸️  PAUSED", color=COLOR_PAUSED)
-        embed.description = (
-            f"### **{discord.utils.escape_markdown(track_display_name(track))}**\n\n"
-            f"`⏸`  `{curr_str}`  `{bar}`  `{total_str}`\n\n"
-            f"👤 **投稿者**: {track.get('uploader', '不明')}\n"
-            f"🔊 **音量**: {state.volume_pct if state else 0}%\n\n"
-            "⚠️３分間の無操作で自動停止します"
+            f"{note}"
         )
         return embed
 
@@ -1047,6 +1039,13 @@ def detach_mixer(guild_id):
         task.cancel()
     guild_tts_queue.pop(guild_id, None)
 
+async def disconnect_voice(guild):
+    """ギルドのミキサーと接続状態を破棄してボイスチャンネルから切断する"""
+    detach_mixer(guild.id)
+    client.connected_channel_ids.pop(guild.id, None)
+    if guild.voice_client:
+        await guild.voice_client.disconnect()
+
 async def process_tts_queue(guild_id):
     queue = guild_tts_queue[guild_id]
     try:
@@ -1070,9 +1069,7 @@ async def process_tts_queue(guild_id):
 
                     guild = client.get_guild(guild_id)
                     if guild and guild.voice_client:
-                        detach_mixer(guild_id)
-                        asyncio.create_task(guild.voice_client.disconnect())
-                        client.connected_channel_ids.pop(guild_id, None)
+                        asyncio.create_task(disconnect_voice(guild))
                     continue
 
                 if audio_bytes is None:
@@ -1281,7 +1278,6 @@ def start_music_progress_loop(guild_id):
                     break
                 except discord.HTTPException as e:
                     print_log(f"プログレス更新エラー (HTTP): {e}")
-                    pass
         except asyncio.CancelledError:
             pass
 
@@ -1312,17 +1308,7 @@ async def play_track(guild, track, message=None):
         async def finish_coro():
             curr_state = guild_music_states.get(guild.id)
             if curr_state and curr_state.source is source:
-                curr_state.cleanup_tasks()
-                curr_state.last_status = "ended"
-                curr_state.source = None
-                if curr_state.message:
-                    try:
-                        tracks = get_cached_tracks(guild.id)
-                        embed = build_music_embed(curr_state, track=curr_state.track, status="ended")
-                        view = MusicPlayerView(guild.id, tracks)
-                        await curr_state.message.edit(embed=embed, view=view)
-                    except Exception:
-                        pass
+                await stop_track(guild, status="ended")
         asyncio.run_coroutine_threadsafe(finish_coro(), loop)
 
     state.track = track
@@ -1400,8 +1386,7 @@ async def stop_track(guild, status="stopped"):
 
 # --- 通知ロジック ---
 async def voice_channel_activity(vc, member, activity_type, before_channel=None, after_channel=None):
-    display_name = member.display_name
-    display_name = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), display_name)
+    display_name = lowercase_ascii(member.display_name)
     
     message = ""
     if activity_type == "入室" and after_channel:
@@ -1458,12 +1443,10 @@ async def schedule_auto_disconnect(guild, channel_id):
     channel_name = vc.channel.name
     text_channel = client.get_channel(client.connected_channel_ids.get(guild.id))
     mention = text_channel.mention if text_channel else "テキストチャンネル"
-    detach_mixer(guild.id)
-    await vc.disconnect()
+    await disconnect_voice(guild)
     if text_channel:
         embed = get_disconnect_embed(mention)
         await text_channel.send(embed=embed)
-    client.connected_channel_ids.pop(guild.id, None)
     print_log(f"自動切断: {channel_name}")
 
 # --- コマンド ---
@@ -1496,11 +1479,9 @@ async def join(interaction: discord.Interaction):
 async def leave(interaction: discord.Interaction):
     if interaction.guild.voice_client:
         mention = interaction.channel.mention
-        detach_mixer(interaction.guild.id)
-        await interaction.guild.voice_client.disconnect()
+        await disconnect_voice(interaction.guild)
         embed = get_disconnect_embed(mention)
         await interaction.response.send_message(embed=embed)
-        client.connected_channel_ids.pop(interaction.guild.id, None)
     else:
         await send_embed(interaction, "エラー", "接続していません。", COLOR_ERROR, True)
 
@@ -1557,9 +1538,8 @@ async def set_voice(interaction: discord.Interaction, voice: app_commands.Choice
 async def status(interaction: discord.Interaction):
     uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     mem = psutil.virtual_memory()
-    tts_data = load_json(WORD_COUNTER_FILE, {"count": 0})
-    tts_count = tts_data.get("count", 0)
-    limit_suffix = " (上限到達)" if tts_count >= TTS_MONTHLY_LIMIT else ""
+    is_limited, tts_count, _ = get_tts_status()
+    limit_suffix = " (上限到達)" if is_limited else ""
 
     embed = discord.Embed(title="ステータス", color=COLOR_NOTICE)
     embed.add_field(name="稼働時間", value=f"`{uptime}`", inline=False)
@@ -1623,7 +1603,7 @@ async def on_message(message):
         if is_consecutive:
             final_text = f"{message.channel.name}に投稿されました。{body}"
         else:
-            display_name = re.sub(r'[a-zA-Z]+', lambda x: x.group(0).lower(), message.author.display_name)
+            display_name = lowercase_ascii(message.author.display_name)
             final_text = f"{message.channel.name}に{display_name}が投稿しました。{body}"
 
     user_voices = load_json(USER_VOICES_FILE, {})
@@ -1644,6 +1624,20 @@ async def on_message(message):
     print_log(f"発言: {message.author.display_name} ({voice_name}) -> {final_text}")
     await speak(vc, final_text, voice_name)
 
+def get_default_text_channel(guild):
+    """自動接続時に案内を送信するテキストチャンネルを解決する"""
+    config = load_json(CONFIG_FILE, {})
+    target_id = config.get(str(guild.id))
+    if target_id:
+        channel = client.get_channel(target_id)
+        if channel:
+            return channel
+    return (
+        discord.utils.get(guild.text_channels, name="読み上げ")
+        or guild.system_channel
+        or (guild.text_channels[0] if guild.text_channels else None)
+    )
+
 @client.event
 async def on_voice_state_update(member, before, after):
     if member.bot or before.channel == after.channel:
@@ -1655,19 +1649,8 @@ async def on_voice_state_update(member, before, after):
     if vc is None and after.channel is not None:
         is_limited, _, reset_ts = get_tts_status()
         if is_limited:
-            config = load_json(CONFIG_FILE, {})
-            target_id = config.get(str(member.guild.id))
-            text_ch = client.get_channel(target_id) if target_id else \
-                      discord.utils.get(member.guild.text_channels, name="読み上げ") or \
-                      member.guild.system_channel or \
-                      member.guild.text_channels[0]
-
-            counter_data = load_json(WORD_COUNTER_FILE, {})
-            last_notice = counter_data.get("last_vc_notice", 0)
-            now_ts = int(time.time())
-            if now_ts - last_notice >= 86400:
-                counter_data["last_vc_notice"] = now_ts
-                save_json(WORD_COUNTER_FILE, counter_data)
+            if should_send_vc_limit_notice():
+                text_ch = get_default_text_channel(member.guild)
                 if text_ch:
                     embed = get_tts_limit_embed(reset_ts)
                     try:
@@ -1680,21 +1663,14 @@ async def on_voice_state_update(member, before, after):
             vc = await after.channel.connect(timeout=10)
             attach_mixer(vc)
 
-            config = load_json(CONFIG_FILE, {})
-            target_id = config.get(str(member.guild.id))
-            
-            text_ch = client.get_channel(target_id) if target_id else \
-                      discord.utils.get(member.guild.text_channels, name="読み上げ") or \
-                      member.guild.system_channel or \
-                      member.guild.text_channels[0]
-            
-            client.connected_channel_ids[member.guild.id] = text_ch.id
-            
-            embed = get_connection_embed(text_ch.mention)
-            await text_ch.send(embed=embed)
-            
+            text_ch = get_default_text_channel(member.guild)
+            if text_ch:
+                client.connected_channel_ids[member.guild.id] = text_ch.id
+                embed = get_connection_embed(text_ch.mention)
+                await text_ch.send(embed=embed)
+
             await speak(vc, "ボイスチャンネルに自動で接続しました。読み上げを開始します。", SYSTEM_VOICE)
-            print_log(f"自動接続: {after.channel.name} (Text: {text_ch.name})")
+            print_log(f"自動接続: {after.channel.name} (Text: {text_ch.name if text_ch else 'なし'})")
         except Exception as e:
             print_log(f"自動接続エラー: {e}")
         return
