@@ -38,8 +38,8 @@ COLOR_PAUSED = 0xf1c40f   # 音楽一時停止 (アンバーイエロー)
 COLOR_IDLE = 0x2b2d31     # 音楽待機/停止 (スレートグレー)
 
 # カスタマイズ設定 (環境変数から取得)
-VERSION = os.getenv("VERSION", "v1.2.0")
-UPDATE_INFO = os.getenv("UPDATE_INFO", "音楽再生機能を追加。読み上げと同時再生や/musicのプログレスバーUIに対応。")
+VERSION = os.getenv("VERSION", "v1.2.1")
+UPDATE_INFO = os.getenv("UPDATE_INFO", "ボイス接続の自動復旧と安定性を改善。/musicの音量調整や月間無料枠ガードに対応。")
 BOT_PRESENCE = os.getenv("BOT_PRESENCE", "github.com/xxxxholica/kikimimi")
 
 # システム案内用
@@ -869,10 +869,31 @@ class PausableAudioSource(discord.AudioSource):
 
 # ギルドID -> 状態 (Botは単一プロセスでの単一/少数サーバー運用を想定しているが、
 # 音楽キャッシュ・再生まわりはサーバー単位で独立させる)
-guild_mixers = {}       # guild_id -> MixingAudioSource
-guild_music_states = {} # guild_id -> MusicPlayerState
-guild_tts_queue = {}    # guild_id -> asyncio.Queue (TTSは従来通り逐次再生)
-guild_tts_tasks = {}    # guild_id -> asyncio.Task (TTSキューの消費タスク)
+guild_mixers = {}          # guild_id -> MixingAudioSource
+guild_music_states = {}    # guild_id -> MusicPlayerState
+guild_tts_queue = {}       # guild_id -> asyncio.Queue (TTSは従来通り逐次再生)
+guild_tts_tasks = {}       # guild_id -> asyncio.Task (TTSキューの消費タスク)
+guild_voice_locks = {}     # guild_id -> asyncio.Lock (VC接続・切断の排他制御)
+guild_voice_watchers = {}  # guild_id -> asyncio.Task (音声WS監視タスク終了の検知)
+
+VOICE_CONNECT_TIMEOUT = 20
+
+def get_voice_lock(guild_id):
+    return guild_voice_locks.setdefault(guild_id, asyncio.Lock())
+
+def has_human_members(channel):
+    return any(not m.bot for m in channel.members)
+
+def is_voice_client_stale(vc):
+    """VoiceClientが未接続かつ内部の接続・再接続タスクも終了している(ゾンビ状態)か判定する"""
+    if vc is None or vc.is_connected():
+        return False
+    conn = getattr(vc, "_connection", None)
+    if conn is None:
+        return True
+    connector_alive = conn._connector is not None and not conn._connector.done()
+    runner_alive = conn._runner is not None and not conn._runner.done()
+    return not (connector_alive or runner_alive)
 
 class MusicPlayerState:
     """各ギルドの音楽再生状況を保持・管理するクラス"""
@@ -1018,14 +1039,21 @@ def build_music_embed(state=None, track=None, status=None):
         return embed
 
 def attach_mixer(vc):
-    """ボイス接続時にミキサーを起動し、そのギルドの再生ハブとして登録する"""
+    """ボイス接続時にミキサーと接続監視タスクを起動し、そのギルドの再生ハブとして登録する"""
+    old_watcher = guild_voice_watchers.pop(vc.guild.id, None)
+    if old_watcher and not old_watcher.done() and old_watcher is not asyncio.current_task():
+        old_watcher.cancel()
     mixer = MixingAudioSource(vc)
     vc.play(mixer)
     guild_mixers[vc.guild.id] = mixer
+    guild_voice_watchers[vc.guild.id] = asyncio.create_task(watch_voice_connection(vc))
     return mixer
 
 def detach_mixer(guild_id):
-    """切断時にそのギルドの再生関連状態を破棄する"""
+    """切断時にそのギルドの再生関連状態と監視タスクを破棄する"""
+    watcher = guild_voice_watchers.pop(guild_id, None)
+    if watcher and not watcher.done() and watcher is not asyncio.current_task():
+        watcher.cancel()
     mixer = guild_mixers.pop(guild_id, None)
     if mixer:
         mixer.cleanup()
@@ -1040,11 +1068,91 @@ def detach_mixer(guild_id):
     guild_tts_queue.pop(guild_id, None)
 
 async def disconnect_voice(guild):
-    """ギルドのミキサーと接続状態を破棄してボイスチャンネルから切断する"""
+    """ギルドのミキサーと接続状態を破棄してボイスチャンネルから確実に切断する"""
     detach_mixer(guild.id)
     client.connected_channel_ids.pop(guild.id, None)
-    if guild.voice_client:
-        await guild.voice_client.disconnect()
+    vc = guild.voice_client
+    if not vc:
+        return
+
+    conn = getattr(vc, "_connection", None)
+    if conn is not None:
+        for task_attr in ("_connector", "_runner"):
+            task = getattr(conn, task_attr, None)
+            if task and not task.done() and task is not asyncio.current_task():
+                task.cancel()
+        # 既にサーバー側でVCから抜けている場合、切断確認イベント待ちで長時間ブロックしないよう短縮する
+        bot_in_vc = bool(guild.me and guild.me.voice and guild.me.voice.channel)
+        if not vc.is_connected() and not bot_in_vc:
+            conn.timeout = min(conn.timeout, 1.0)
+
+    try:
+        await vc.disconnect(force=True)
+    except Exception as e:
+        print_log(f"切断処理エラー: {e}")
+    finally:
+        if guild.voice_client is vc:
+            vc.cleanup()
+
+async def watch_voice_connection(vc):
+    """discord.pyの音声WS監視タスク(_runner)の終了を検知し、ゾンビ化したVoiceClientを回収・再接続する"""
+    conn = getattr(vc, "_connection", None)
+    runner = getattr(conn, "_runner", None) if conn else None
+    if runner is None:
+        return
+
+    try:
+        if not runner.done():
+            done_event = asyncio.Event()
+            runner.add_done_callback(lambda _: done_event.set())
+            await done_event.wait()
+
+        # 通常の切断処理や直後のVoiceStateイベント反映を少し待つ
+        await asyncio.sleep(1.0)
+
+        guild = vc.guild
+        async with get_voice_lock(guild.id):
+            current_vc = guild.voice_client
+            if current_vc is None:
+                # サーバー側からの強制切断(4014等)でdiscord.pyが既にvoice_clientを除去した場合、残ったミキサー等を掃除
+                if guild.id in guild_mixers or guild.id in client.connected_channel_ids:
+                    detach_mixer(guild.id)
+                    client.connected_channel_ids.pop(guild.id, None)
+                    print_log(f"外部切断に伴う再生状態のクリーンアップ完了: guild={guild.id}")
+                return
+
+            if current_vc is not vc or vc.is_connected():
+                return
+            if not is_voice_client_stale(vc):
+                return
+
+            target_channel = guild.get_channel(vc.channel.id) if vc.channel else None
+            saved_text_ch_id = client.connected_channel_ids.get(guild.id)
+            print_log(f"音声WS監視タスク終了後の未接続VoiceClientを検知・破棄: {target_channel.name if target_channel else guild.id}")
+            await disconnect_voice(guild)
+
+            # チャンネルにまだ人が残っており、月間上限に達していなければ自動で再接続する
+            is_limited, _, _ = get_tts_status()
+            if target_channel and has_human_members(target_channel) and not is_limited:
+                try:
+                    new_vc = await target_channel.connect(timeout=VOICE_CONNECT_TIMEOUT)
+                    attach_mixer(new_vc)
+                    if saved_text_ch_id:
+                        client.connected_channel_ids[guild.id] = saved_text_ch_id
+                    print_log(f"音声切断からの自動再接続完了: {target_channel.name}")
+                except Exception as e:
+                    print_log(f"音声切断からの自動再接続エラー: {e}")
+                    if guild.voice_client and not guild.voice_client.is_connected():
+                        await disconnect_voice(guild)
+            elif saved_text_ch_id:
+                text_channel = client.get_channel(saved_text_ch_id)
+                if text_channel:
+                    try:
+                        await text_channel.send(embed=get_disconnect_embed(text_channel.mention))
+                    except Exception:
+                        pass
+    except asyncio.CancelledError:
+        pass
 
 async def process_tts_queue(guild_id):
     queue = guild_tts_queue[guild_id]
@@ -1434,25 +1542,33 @@ async def schedule_auto_disconnect(guild, channel_id):
     """退室検知後、一定時間待ってから本当に誰もいなくなったか再確認して切断する(通信瞬断による誤切断を防止)"""
     await asyncio.sleep(AUTO_DISCONNECT_GRACE_SECONDS)
 
-    vc = guild.voice_client
-    if not vc or not vc.is_connected() or vc.channel.id != channel_id:
-        return
-    if len(vc.channel.members) > 1:
-        return
+    async with get_voice_lock(guild.id):
+        vc = guild.voice_client
+        if not vc:
+            return
+        if vc.channel and vc.channel.id != channel_id:
+            return
 
-    channel_name = vc.channel.name
-    text_channel = client.get_channel(client.connected_channel_ids.get(guild.id))
-    mention = text_channel.mention if text_channel else "テキストチャンネル"
-    await disconnect_voice(guild)
-    if text_channel:
-        embed = get_disconnect_embed(mention)
-        await text_channel.send(embed=embed)
-    print_log(f"自動切断: {channel_name}")
+        channel = guild.get_channel(channel_id) or vc.channel
+        if channel and has_human_members(channel):
+            return
+
+        channel_name = channel.name if channel else str(channel_id)
+        text_channel = client.get_channel(client.connected_channel_ids.get(guild.id))
+        mention = text_channel.mention if text_channel else "テキストチャンネル"
+        await disconnect_voice(guild)
+        if text_channel:
+            embed = get_disconnect_embed(mention)
+            try:
+                await text_channel.send(embed=embed)
+            except Exception as e:
+                print_log(f"切断通知送信エラー: {e}")
+        print_log(f"自動切断: {channel_name}")
 
 # --- コマンド ---
 @client.tree.command(name='join', description='ボイスチャンネルに接続して読み上げを開始します')
 async def join(interaction: discord.Interaction):
-    if not interaction.user.voice:
+    if not interaction.user.voice or not interaction.user.voice.channel:
         await send_embed(interaction, "エラー", "ボイスチャンネルに参加してから実行してください", COLOR_ERROR, True)
         return
 
@@ -1464,26 +1580,57 @@ async def join(interaction: discord.Interaction):
 
     await interaction.response.defer()
     channel = interaction.user.voice.channel
-    try:
-        vc = await channel.connect(timeout=10)
-        attach_mixer(vc)
-        client.connected_channel_ids[interaction.guild.id] = interaction.channel_id
+    guild = interaction.guild
 
-        embed = get_connection_embed(interaction.channel.mention)
-        await interaction.followup.send(embed=embed)
-        await speak(vc, "ボイスチャンネルに接続しました。読み上げを開始します。", SYSTEM_VOICE)
-    except Exception as e:
-        await send_embed(interaction, "エラー", f"接続に失敗しました: {e}", COLOR_ERROR)
+    async with get_voice_lock(guild.id):
+        vc = guild.voice_client
+        if vc is not None:
+            if not vc.is_connected():
+                print_log(f"/join 実行時に未接続のVoiceClientを破棄: guild={guild.id}")
+                await disconnect_voice(guild)
+            elif vc.channel == channel:
+                if guild.id not in guild_mixers:
+                    attach_mixer(vc)
+                client.connected_channel_ids[guild.id] = interaction.channel_id
+                embed = get_connection_embed(interaction.channel.mention)
+                await interaction.followup.send(embed=embed)
+                return
+            elif vc.channel and has_human_members(vc.channel):
+                await send_embed(
+                    interaction,
+                    "案内",
+                    f"すでに {vc.channel.mention} に接続しています。移動させる場合は先に {cmd_mention('leave')} を実行してください。",
+                    COLOR_NOTICE,
+                )
+                return
+            else:
+                await disconnect_voice(guild)
+
+        try:
+            vc = await channel.connect(timeout=VOICE_CONNECT_TIMEOUT)
+            attach_mixer(vc)
+            client.connected_channel_ids[guild.id] = interaction.channel_id
+
+            embed = get_connection_embed(interaction.channel.mention)
+            await interaction.followup.send(embed=embed)
+            await speak(vc, "ボイスチャンネルに接続しました。読み上げを開始します。", SYSTEM_VOICE)
+        except Exception as e:
+            if guild.voice_client and not guild.voice_client.is_connected():
+                await disconnect_voice(guild)
+            await send_embed(interaction, "エラー", f"接続に失敗しました: {e}", COLOR_ERROR)
 
 @client.tree.command(name='leave', description='ボイスチャンネルから切断します')
 async def leave(interaction: discord.Interaction):
-    if interaction.guild.voice_client:
-        mention = interaction.channel.mention
-        await disconnect_voice(interaction.guild)
-        embed = get_disconnect_embed(mention)
-        await interaction.response.send_message(embed=embed)
-    else:
+    if not interaction.guild.voice_client:
         await send_embed(interaction, "エラー", "接続していません。", COLOR_ERROR, True)
+        return
+
+    await interaction.response.defer()
+    mention = interaction.channel.mention
+    async with get_voice_lock(interaction.guild.id):
+        await disconnect_voice(interaction.guild)
+    embed = get_disconnect_embed(mention)
+    await interaction.followup.send(embed=embed)
 
 @client.tree.command(name='music', description='音楽プレイヤーを表示し、曲の再生・一時停止・停止・音量調整を操作します')
 @app_commands.describe(volume='音量を0〜100%で設定します(省略時は現在の音量のまま)')
@@ -1642,8 +1789,14 @@ def get_default_text_channel(guild):
 async def on_voice_state_update(member, before, after):
     if member.bot or before.channel == after.channel:
         return
-    
+
     vc = member.guild.voice_client
+    if vc is not None and is_voice_client_stale(vc):
+        async with get_voice_lock(member.guild.id):
+            if member.guild.voice_client is vc and is_voice_client_stale(vc):
+                print_log(f"残留していた未接続VoiceClientを破棄: guild={member.guild.id}")
+                await disconnect_voice(member.guild)
+        vc = member.guild.voice_client
 
     # --- 自動接続ロジック ---
     if vc is None and after.channel is not None:
@@ -1659,23 +1812,41 @@ async def on_voice_state_update(member, before, after):
                         print_log(f"上限通知送信エラー: {e}")
             return
 
-        try:
-            vc = await after.channel.connect(timeout=10)
-            attach_mixer(vc)
+        connected_by_other = False
+        async with get_voice_lock(member.guild.id):
+            vc = member.guild.voice_client
+            if vc is not None and is_voice_client_stale(vc):
+                await disconnect_voice(member.guild)
+                vc = None
 
-            text_ch = get_default_text_channel(member.guild)
-            if text_ch:
-                client.connected_channel_ids[member.guild.id] = text_ch.id
-                embed = get_connection_embed(text_ch.mention)
-                await text_ch.send(embed=embed)
+            if vc is not None:
+                connected_by_other = True
+            elif has_human_members(after.channel):
+                try:
+                    vc = await after.channel.connect(timeout=VOICE_CONNECT_TIMEOUT)
+                    attach_mixer(vc)
 
-            await speak(vc, "ボイスチャンネルに自動で接続しました。読み上げを開始します。", SYSTEM_VOICE)
-            print_log(f"自動接続: {after.channel.name} (Text: {text_ch.name if text_ch else 'なし'})")
-        except Exception as e:
-            print_log(f"自動接続エラー: {e}")
-        return
+                    text_ch = get_default_text_channel(member.guild)
+                    if text_ch:
+                        client.connected_channel_ids[member.guild.id] = text_ch.id
+                        embed = get_connection_embed(text_ch.mention)
+                        try:
+                            await text_ch.send(embed=embed)
+                        except Exception as e:
+                            print_log(f"接続通知送信エラー: {e}")
 
-    if not vc:
+                    await speak(vc, "ボイスチャンネルに自動で接続しました。読み上げを開始します。", SYSTEM_VOICE)
+                    print_log(f"自動接続: {after.channel.name} (Text: {text_ch.name if text_ch else 'なし'})")
+                except Exception as e:
+                    print_log(f"自動接続エラー: {e}")
+                    if member.guild.voice_client and not member.guild.voice_client.is_connected():
+                        await disconnect_voice(member.guild)
+
+        if not connected_by_other:
+            return
+        vc = member.guild.voice_client
+
+    if not vc or not vc.channel:
         return
 
     is_event_in_current_vc = (before.channel == vc.channel) or (after.channel == vc.channel)
@@ -1686,11 +1857,11 @@ async def on_voice_state_update(member, before, after):
         await voice_channel_activity(vc, member, "入室", after_channel=after.channel)
     elif after.channel is None and before.channel:
         await voice_channel_activity(vc, member, "退室", before_channel=before.channel)
-        
-        if len(vc.channel.members) == 1:
+        if not has_human_members(vc.channel):
             asyncio.create_task(schedule_auto_disconnect(member.guild, vc.channel.id))
-
     elif before.channel and after.channel:
         await voice_channel_activity(vc, member, "移動", before_channel=before.channel, after_channel=after.channel)
+        if before.channel == vc.channel and not has_human_members(vc.channel):
+            asyncio.create_task(schedule_auto_disconnect(member.guild, vc.channel.id))
 
 client.run(os.environ.get("KIKIMIMI_BOT_TOKEN"))
